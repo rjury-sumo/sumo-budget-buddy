@@ -1,0 +1,46 @@
+[project]
+name = "sumo-budget-buddy"
+version = "0.1.0"
+description = "Ephemeral, per-category ingest budget enforcement for Sumo Logic"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.32",
+    "pyyaml>=6",
+    "rich>=13",
+    "python-dotenv>=1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "responses>=0.25",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+sumo-budget-buddy = "budget_buddy.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["budget_buddy*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",
+    "F401",
+]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["budget_buddy/tests"]
+python_files = ["test_*.py"]

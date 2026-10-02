@@ -2,16 +2,17 @@
 instance_config.py — named Sumo Logic instance (org) credential resolution
 for budget_buddy.
 
-Vendored and trimmed from cli/config.py (read-only resolution only — no
-`sumo instances add/remove` equivalent here, budget_buddy never needs to
-write this file) so budget_buddy has no import dependency on the parent
-sumo-ai repo. Deliberately kept compatible with the same ~/.sumo/instances.toml
-file and SUMO_ACCESS_ID[_NAME]-style env var convention, so a budget_buddy
-installed alongside the main `sumo` CLI shares the same instance definitions
-without any code coupling between the two.
+Vendored and trimmed from cli/config.py (incl. a trimmed `save_instance`/
+`remove_instance` write path, backing `sumo-budget-buddy instances set` /
+`remove` — see cli.py) so budget_buddy has no import dependency on the
+parent sumo-ai repo. Deliberately kept compatible with the same
+~/.sumo/instances.toml file and SUMO_ACCESS_ID[_NAME]-style env var
+convention, so a budget_buddy installed alongside the main `sumo` CLI
+shares the same instance definitions without any code coupling between
+the two.
 
-Config file (~/.sumo/instances.toml)
--------------------------------------
+Config file (~/.sumo/instances.toml) — entirely optional, see below
+---------------------------------------------------------------------
   [instances.default]
   access_id  = "..."
   access_key = "..."
@@ -23,6 +24,13 @@ Environment variables
   'default' instance:   SUMO_ACCESS_ID, SUMO_ACCESS_KEY, SUMO_ENDPOINT
   named instance <NAME>: SUMO_ACCESS_ID_<NAME>, SUMO_ACCESS_KEY_<NAME>, SUMO_ENDPOINT_<NAME>
   Env vars always override the config file for the matching instance.
+
+  A named instance needs NO instances.toml entry at all: `--instance prod`
+  with just SUMO_ACCESS_ID_PROD / SUMO_ACCESS_KEY_PROD set resolves fine on
+  its own (`load_instances()` falls back to `{}` for an unknown name). The
+  config file is only for persisting values you don't want to re-export
+  every session (or metadata like region/description) — and even then, any
+  individual field can still be left to its env var instead.
 """
 from __future__ import annotations
 
@@ -91,6 +99,126 @@ def load_instances() -> dict[str, dict]:
         merged[name] = {**merged.get(name, {}), **cfg}
     merged.setdefault("default", {})
     return merged
+
+
+def instance_status(name: str, cfg: dict | None = None) -> dict:
+    """Credential availability (and env-var vs config-file source) for one
+    instance `name` — works even if `name` has no instances.toml entry at
+    all, since a purely env-defined instance (SUMO_ACCESS_ID_<NAME> etc.)
+    is fully valid and never needs one."""
+    name = name.lower()
+    if cfg is None:
+        cfg = load_instances().get(name, {})
+    sfx = _env_suffix(name)
+    id_env = os.environ.get(f"SUMO_ACCESS_ID{sfx}")
+    key_env = os.environ.get(f"SUMO_ACCESS_KEY{sfx}")
+    access_id = id_env or cfg.get("access_id")
+    access_key = key_env or cfg.get("access_key")
+    endpoint = (os.environ.get(f"SUMO_ENDPOINT{sfx}")
+                or cfg.get("endpoint")
+                or endpoint_for_region(cfg.get("region"))
+                or DEFAULT_ENDPOINT)
+
+    def _src(env_val, cfg_val):
+        if env_val:
+            return "env"
+        if cfg_val:
+            return "config"
+        return "missing"
+
+    return {
+        "name": name,
+        "endpoint": endpoint,
+        "ui_base_url": os.environ.get(f"SUMO_UI_BASE_URL{sfx}") or cfg.get("ui_base_url"),
+        "region": cfg.get("region"),
+        "description": cfg.get("description"),
+        "has_credentials": bool(access_id and access_key),
+        "access_id_source": _src(id_env, cfg.get("access_id")),
+        "access_key_source": _src(key_env, cfg.get("access_key")),
+    }
+
+
+def list_instances_with_status() -> list[dict]:
+    """Every instance with an instances.toml entry (plus 'default', always
+    present) and its credential status — backs `sumo-budget-buddy instances
+    list`. A purely env-defined instance with no toml entry won't appear
+    here (nothing to enumerate it from) but still resolves fine via
+    `instance_status(name)` / `resolve_instance(name)` directly."""
+    return [instance_status(name, cfg) for name, cfg in load_instances().items()]
+
+
+_WRITABLE_FIELDS = ("access_id", "access_key", "endpoint", "ui_base_url", "region", "description")
+
+_TOML_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _toml_escape(value: str) -> str:
+    return "".join(_TOML_ESCAPES.get(c, c) for c in str(value))
+
+
+def _load_toml_strict(path: Path) -> dict:
+    """Like `_load_toml`, but lets a parse failure raise instead of
+    silently returning {} — used on the write path so a malformed file
+    can't look like an empty one and get overwritten, wiping every other
+    saved instance."""
+    if not path.exists():
+        return {}
+    with open(path, "rb") as fh:
+        return tomllib.load(fh)
+
+
+def _load_instances_for_write(path: Path) -> dict[str, dict]:
+    try:
+        data = _load_toml_strict(path)
+    except Exception as exc:
+        raise SystemExit(
+            f"refusing to update {path}: it is not valid TOML ({exc}). "
+            "Fix or remove it by hand, then retry."
+        )
+    return {k.lower(): v for k, v in data.get("instances", {}).items()}
+
+
+def _write_instances_toml(instances: dict[str, dict]) -> None:
+    """Serialise `instances` back to ~/.sumo/instances.toml. Hand-rolled
+    rather than a TOML-writer dependency: the shape here is always a flat
+    `[instances.<name>]` table of string fields, nothing a generic writer
+    is needed for."""
+    GLOBAL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for name, cfg in instances.items():
+        lines.append(f'[instances."{_toml_escape(name)}"]')
+        ordered_keys = list(_WRITABLE_FIELDS) + [k for k in cfg if k not in _WRITABLE_FIELDS]
+        for key in ordered_keys:
+            val = cfg.get(key)
+            if val is not None:
+                lines.append(f'{key} = "{_toml_escape(val)}"')
+        lines.append("")
+    GLOBAL_CONFIG.write_text("\n".join(lines))
+
+
+def save_instance(name: str, fields: dict) -> None:
+    """Add or update a named instance in ~/.sumo/instances.toml, merging
+    with whatever is already there — only the given fields are touched."""
+    name = name.lower()
+    global_data = _load_instances_for_write(GLOBAL_CONFIG)
+    existing = global_data.get(name, {})
+    global_data[name] = {**existing, **{k: v for k, v in fields.items() if v is not None}}
+    _write_instances_toml(global_data)
+
+
+def remove_instance(name: str) -> None:
+    """Remove a named instance from ~/.sumo/instances.toml."""
+    name = name.lower()
+    global_data = _load_instances_for_write(GLOBAL_CONFIG)
+    if name not in global_data:
+        if name in load_instances():
+            raise SystemExit(
+                f"instance {name!r} is not in {GLOBAL_CONFIG} (it comes from {PROJECT_CONFIG} "
+                "or an environment variable) — nothing to remove here"
+            )
+        raise SystemExit(f"instance {name!r} not found in {GLOBAL_CONFIG}")
+    del global_data[name]
+    _write_instances_toml(global_data)
 
 
 def _env_suffix(name: str) -> str:

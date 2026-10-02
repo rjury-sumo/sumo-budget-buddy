@@ -1,0 +1,31 @@
+# Example sumo-budget-buddy config.
+#
+# Copy this to ~/.sumo/budget-buddy.yaml (the default --config path) or
+# anywhere else and pass --config PATH explicitly. See README.md, "Config
+# file" (and docs/budget-buddy-plan.md#config-file for the full schema
+# reference).
+
+instance: default            # credential profile; per-scope override allowed
+
+defaults:                    # fallback values; any scope can override any key
+  mode: per_value            # per_value | aggregate
+  window: today               # today | yesterday | last_Nh | YYYY-MM-DD/YYYY-MM-DD
+  tz: America/Los_Angeles
+  threshold_bytes: 5368709120  # 5 GiB
+  budget_type: dailyVolume     # dailyVolume | minuteVolume
+  action: stopCollecting       # stopCollecting | keepCollecting
+  max_budgets: 50
+  audit_threshold: 85
+
+scopes:
+  - name: cloudtrail-prod
+    description: "AWS CloudTrail logs, prod org"
+    field: _sourceCategory
+    scope: "_sourceCategory=*cloudtrail*"
+    # all other keys inherited from `defaults` unless overridden here
+
+  - name: test-foo-rollup
+    field: _sourceCategory
+    scope: "_sourceCategory=test/foo/*"
+    mode: per_value              # each matching value tracked independently
+    threshold_bytes: 1073741824  # 1 GiB override for this scope

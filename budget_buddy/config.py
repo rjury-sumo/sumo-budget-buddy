@@ -18,6 +18,9 @@ DEFAULT_THRESHOLD_BYTES = 5 * 1024 ** 3  # 5 GiB
 DEFAULT_MAX_BUDGETS = 50
 DEFAULT_AUDIT_THRESHOLD = 85
 
+# Same ~/.sumo/ convention as instance_config.GLOBAL_CONFIG (~/.sumo/instances.toml).
+DEFAULT_CONFIG_PATH = Path.home() / ".sumo" / "budget-buddy.yaml"
+
 _SCOPE_DEFAULTS = {
     "mode": "per_value",
     "window": "today",

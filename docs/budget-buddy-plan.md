@@ -308,9 +308,12 @@ this tool only creates blocking budgets.)
 
 ## Config file
 
-A single YAML file (`budget-buddy.yaml` by default, `--config PATH` to
-override) defines named scopes. A run targets one or more scopes by name, or
-`--all`.
+A single YAML file defines named scopes. `--config PATH` points at it
+explicitly; if omitted, `~/.sumo/budget-buddy.yaml` (`config.DEFAULT_CONFIG_PATH`,
+same `~/.sumo/` convention as `instance_config.GLOBAL_CONFIG`) is used when it
+exists. A run targets one or more scopes by name, or `--all`. See
+`budget-buddy.example.yaml` in the repo root for a ready-to-copy starting
+point.
 
 ```yaml
 instance: default            # instance_config.py credential profile; per-scope override allowed
@@ -435,7 +438,7 @@ those four touchpoints was vendored instead:
 | Was | Now | Notes |
 | --- | --- | --- |
 | `from cli import http_client` | `budget_buddy/http_client.py` | Verbatim copy — already had zero `cli.*` deps of its own. |
-| `from cli.config import resolve_instance` | `budget_buddy/instance_config.py` | Trimmed to read-only resolution (no `sumo instances add/remove` equivalent — budget-buddy never writes this file). Same `~/.sumo/instances.toml` format and `SUMO_ACCESS_ID[_NAME]` env convention, so it reads the same config a co-installed `sumo` CLI uses, with zero import coupling. |
+| `from cli.config import resolve_instance` | `budget_buddy/instance_config.py` | Trimmed version, now including a `save_instance`/`remove_instance` write path (backing the `sumo-budget-buddy instances set`/`remove` subcommands, see "Commands" below). Same `~/.sumo/instances.toml` format and `SUMO_ACCESS_ID[_NAME]` env convention, so it reads/writes the same config a co-installed `sumo` CLI uses, with zero import coupling. |
 | `from cli.paths import instance_root` | `budget_buddy/paths.py` | Inlined the `SUMO_HOME`/`OUTPUT_ROOT`/`instance_root` logic directly — same `~/.sumo/output/<instance>/` layout convention, no import. |
 | `from cli.volume import _DIMS` | `budget_buddy/volume_query.py` (`VOLUME_DIMS`) | Inlined, trimmed to the four keys this tool actually reads (`scope`, `json_alias`, `dim_key`, `dim_field` — dropped `group_by`/`display`, which budget-buddy never used). |
 
@@ -459,25 +462,32 @@ suggested minimal `pyproject.toml` for exactly that extraction.
 ## Commands
 
 ```
-sumo-budget-buddy evaluate   --config PATH (--scope NAME [NAME...] | --all)
+sumo-budget-buddy evaluate   [--config PATH] (--scope NAME [NAME...] | --all)
                               [--instance NAME] [--json] [--log-level LEVEL]
-                              # also supports pure ad-hoc mode without a config
+                              # --config defaults to ~/.sumo/budget-buddy.yaml
+                              # when present (DEFAULT_CONFIG_PATH); also
+                              # supports pure ad-hoc mode without any config
                               # file, for a quick one-off measurement:
                               #   --field _sourceCategory --scope-expr "*" \
                               #   --mode per_value|aggregate --window today \
                               #   --tz America/Los_Angeles --threshold-bytes N
 
-sumo-budget-buddy enforce    --config PATH (--scope NAME [NAME...] | --all)
+sumo-budget-buddy enforce    [--config PATH] (--scope NAME [NAME...] | --all)
                               [--instance NAME] [--dry-run] [--force]
                               [--log-level LEVEL]
+                              # --config defaults to ~/.sumo/budget-buddy.yaml
+                              # when present, same as evaluate
                               # --force: clear a stale concurrency lock left
                               # by a prior run that crashed (see Concurrency
                               # control below) — NOT a bypass of any budget
                               # logic, purely the lock.
 
-sumo-budget-buddy sweep      --config PATH [--scope NAME ...] [--force]
+sumo-budget-buddy sweep      [--scope NAME ...] [--force]
                               [--dry-run] [--log-level LEVEL]
                               # deletes any registry entries past expires_at;
+                              # filters by scope name straight off the registry
+                              # (no config file needed — unlike `enforce`,
+                              # sweep never needs to resolve scope *definitions*)
                               # --force here means the same lock override as
                               # `enforce`
 
@@ -499,6 +509,14 @@ sumo-budget-buddy list       [--instance NAME] [--all-budgets]
 
 sumo-budget-buddy status     <id-or-scope-name:value>
                               # one budget's detail + current usage via GET
+
+sumo-budget-buddy instances  list | show <name> | set <name> [FIELDS...] | remove <name>
+                              # CLI wrapper around ~/.sumo/instances.toml —
+                              # list/show report has_credentials + per-field
+                              # env-vs-config source; set/remove write the
+                              # file (merging partial updates). access_key is
+                              # always fully masked; access_id gets a short
+                              # (non-secret) preview only.
 ```
 
 ### `list` — terminal-friendly output

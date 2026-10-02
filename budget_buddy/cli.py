@@ -9,8 +9,12 @@ import sys
 from contextlib import ExitStack
 from dataclasses import asdict
 
-from budget_buddy import lock, naming
-from budget_buddy.config import ConfigError, ScopeConfig, load_config, select_scopes
+from budget_buddy import instance_config, lock, naming
+from budget_buddy.config import ConfigError, DEFAULT_CONFIG_PATH, ScopeConfig, load_config, select_scopes
+from budget_buddy.instance_config import (
+    REGION_ENDPOINTS, endpoint_for_region, instance_status,
+    list_instances_with_status, load_instances, remove_instance, save_instance,
+)
 from budget_buddy.logging_setup import configure_logging
 from budget_buddy.output import infer_format, render_detail, render_rows
 from budget_buddy.reconcile import ClientCache, enforce_scope, evaluate_scope, sweep_registry
@@ -49,7 +53,7 @@ def _common_parser() -> argparse.ArgumentParser:
 
 
 def _config_scope_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--config", help="path to budget-buddy.yaml")
+    p.add_argument("--config", help=f"path to budget-buddy.yaml (default: {DEFAULT_CONFIG_PATH})")
     p.add_argument("--scope", action="append", dest="scopes", metavar="NAME",
                    help="named scope to target (repeatable)")
     p.add_argument("--all", action="store_true", help="target every scope in --config")
@@ -82,8 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_enf.add_argument("--force", action="store_true", help="clear a stale concurrency lock")
 
     p_swp = sub.add_parser("sweep", parents=[common], help="delete expired budget-buddy-managed budgets")
-    p_swp.add_argument("--config", help="path to budget-buddy.yaml (only needed to resolve --scope names)")
-    p_swp.add_argument("--scope", action="append", dest="scopes", metavar="NAME")
+    p_swp.add_argument("--scope", action="append", dest="scopes", metavar="NAME",
+                        help="only sweep entries recorded under this scope name (repeatable)")
     p_swp.add_argument("--instance", default="default")
     p_swp.add_argument("--dry-run", action="store_true")
     p_swp.add_argument("--force", action="store_true", help="clear a stale concurrency lock")
@@ -98,6 +102,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("target", help="budget ID, or scope_name:key to resolve via the registry")
     p_status.add_argument("--instance", default="default")
 
+    p_inst = sub.add_parser("instances", parents=[common],
+                             help=f"list or manage named Sumo instances ({instance_config.GLOBAL_CONFIG})")
+    inst_sub = p_inst.add_subparsers(dest="instances_action", required=True)
+
+    p_inst_list = inst_sub.add_parser("list", parents=[common], help="show every configured instance")
+    p_inst_list.add_argument("--format", choices=["table", "json", "csv"])
+    p_inst_list.add_argument("--output")
+
+    p_inst_show = inst_sub.add_parser("show", parents=[common], help="detail for one instance (secrets masked)")
+    p_inst_show.add_argument("name")
+
+    p_inst_set = inst_sub.add_parser(
+        "set", parents=[common], help="add or update a named instance (only given fields are touched)")
+    p_inst_set.add_argument("name")
+    p_inst_set.add_argument("--access-id", dest="access_id")
+    p_inst_set.add_argument("--access-key", dest="access_key")
+    p_inst_set.add_argument("--endpoint", help="API endpoint URL (if omitted, derived from --region)")
+    p_inst_set.add_argument("--ui-base-url", dest="ui_base_url")
+    p_inst_set.add_argument("--region", help=f"one of: {', '.join(sorted(REGION_ENDPOINTS))}")
+    p_inst_set.add_argument("--description")
+
+    p_inst_remove = inst_sub.add_parser(
+        "remove", parents=[common], help="remove a named instance from the config file")
+    p_inst_remove.add_argument("name")
+
     return parser
 
 
@@ -107,13 +136,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _resolve_scopes(args) -> list[ScopeConfig]:
     if args.config:
-        cfg = load_config(args.config)
+        config_path = args.config
+    elif getattr(args, "field", None) or getattr(args, "scope_expr", None):
+        # explicit ad-hoc flags take precedence over a stale default config file
+        config_path = None
+    else:
+        config_path = DEFAULT_CONFIG_PATH if DEFAULT_CONFIG_PATH.exists() else None
+
+    if config_path:
+        cfg = load_config(config_path)
         for w in cfg.warnings:
             logger.warning(w)
         return select_scopes(cfg, args.scopes, args.all)
 
     if not args.field or not args.scope_expr:
-        raise ConfigError("either --config (with --scope/--all) or --field + --scope-expr is required")
+        raise ConfigError(
+            "either --config (with --scope/--all), a config file at "
+            f"{DEFAULT_CONFIG_PATH}, or --field + --scope-expr is required"
+        )
     return [ScopeConfig(
         name="adhoc", field=args.field, scope=args.scope_expr, mode=args.mode,
         window=args.window, tz=args.tz, threshold_bytes=args.threshold_bytes,
@@ -276,6 +316,96 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _preview(raw_value: str | None, source: str, *, reveal_prefix: bool) -> str:
+    """`reveal_prefix` must be False for any true secret (access_key) —
+    only access_id (an identifier, not a secret) gets a partial preview."""
+    if source == "env":
+        return "set"
+    if source != "config":
+        return "missing"
+    if reveal_prefix and raw_value and len(raw_value) > 4:
+        return raw_value[:4] + "****"
+    return "****"
+
+
+def cmd_instances_list(args) -> int:
+    rows = [{
+        "name": inst["name"],
+        "credentials": "ok" if inst["has_credentials"] else "MISSING",
+        "access_id": inst["access_id_source"],
+        "access_key": inst["access_key_source"],
+        "endpoint": inst["endpoint"],
+        "region": inst.get("region") or "",
+        "description": inst.get("description") or "",
+    } for inst in list_instances_with_status()]
+    fmt = infer_format(args.output, args.format)
+    columns = ["name", "credentials", "access_id", "access_key", "endpoint", "region", "description"]
+    render_rows(rows, columns, fmt=fmt, output=args.output, title="sumo-budget-buddy instances")
+    return 0
+
+
+def cmd_instances_show(args) -> int:
+    name = args.name.lower()
+    raw = load_instances().get(name, {})
+    inst = instance_status(name, raw)
+    detail = {
+        "endpoint": inst["endpoint"],
+        "ui_base_url": inst.get("ui_base_url") or "",
+        "region": inst.get("region") or "",
+        "description": inst.get("description") or "",
+        "access_id": f"{_preview(raw.get('access_id'), inst['access_id_source'], reveal_prefix=True)} "
+                     f"(source: {inst['access_id_source']})",
+        "access_key": f"{_preview(raw.get('access_key'), inst['access_key_source'], reveal_prefix=False)} "
+                      f"(source: {inst['access_key_source']})",
+    }
+    render_detail(detail, title=f"instance {name}")
+    return 0
+
+
+def cmd_instances_set(args) -> int:
+    name = args.name.lower()
+    fields = {
+        "access_id": args.access_id, "access_key": args.access_key,
+        "endpoint": args.endpoint, "ui_base_url": args.ui_base_url,
+        "region": args.region, "description": args.description,
+    }
+    if args.region and args.endpoint is None:
+        derived = endpoint_for_region(args.region)
+        if derived:
+            fields["endpoint"] = derived
+        else:
+            print(f"warning: unrecognized region {args.region!r} (known: "
+                  f"{', '.join(sorted(REGION_ENDPOINTS))}) — endpoint not derived, "
+                  "pass --endpoint explicitly if needed", file=sys.stderr)
+
+    fields = {k: v for k, v in fields.items() if v is not None}
+    if not fields:
+        print("error: provide at least one field to set (e.g. --access-id, --endpoint)", file=sys.stderr)
+        return 2
+
+    save_instance(name, fields)
+    print(f"instance {name!r} saved to {instance_config.GLOBAL_CONFIG} (fields: {', '.join(fields)})")
+    return 0
+
+
+def cmd_instances_remove(args) -> int:
+    try:
+        remove_instance(args.name)
+    except SystemExit as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"instance {args.name!r} removed from {instance_config.GLOBAL_CONFIG}")
+    return 0
+
+
+def cmd_instances(args) -> int:
+    handlers = {
+        "list": cmd_instances_list, "show": cmd_instances_show,
+        "set": cmd_instances_set, "remove": cmd_instances_remove,
+    }
+    return handlers[args.instances_action](args)
+
+
 # ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
@@ -287,7 +417,7 @@ def main(argv: list[str] | None = None) -> int:
 
     handlers = {
         "evaluate": cmd_evaluate, "enforce": cmd_enforce, "sweep": cmd_sweep,
-        "list": cmd_list, "status": cmd_status,
+        "list": cmd_list, "status": cmd_status, "instances": cmd_instances,
     }
     try:
         return handlers[args.command](args)

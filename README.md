@@ -53,7 +53,7 @@ export SUMO_ENDPOINT=https://api.au.sumologic.com   # default; see region table 
 ```
 
 Named instances: `SUMO_ACCESS_ID_<NAME>` / `SUMO_ACCESS_KEY_<NAME>` /
-`SUMO_ENDPOINT_<NAME>`, or an `[instances.<name>]` section in
+`SUMO_ENDPOINT_<NAME>`, **or** an `[instances.<name>]` section in
 `~/.sumo/instances.toml`:
 
 ```toml
@@ -63,6 +63,29 @@ access_key = "..."
 endpoint   = "https://api.au.sumologic.com"
 region     = "AU"
 ```
+
+**The `instances.toml` section is entirely optional** — the two are
+alternatives, not layers you both need. `--instance prod` with just
+`SUMO_ACCESS_ID_PROD` / `SUMO_ACCESS_KEY_PROD` exported works with *no*
+`[instances.prod]` section at all; nothing needs to be hardcoded in the
+config file just because an instance has a name. The config file exists for
+persisting values across sessions (so you don't re-export every time) or for
+metadata env vars don't carry (`region`, `description`) — and even then any
+single field can still be left to its env var instead of being written to
+disk. Env vars always win over the config file for a given field.
+
+Manage `instances.toml` without hand-editing it:
+
+```bash
+sumo-budget-buddy instances list                    # every configured instance + credential status
+sumo-budget-buddy instances show prod                # one instance's detail (secrets masked)
+sumo-budget-buddy instances set prod --access-id ... --access-key ... --region AU
+sumo-budget-buddy instances remove prod
+```
+
+`list`/`show` report, per field, whether its value is coming from an env var
+or the config file — `set` only writes the fields you pass, leaving the rest
+of that instance's entry (and every other instance) untouched.
 
 | Region | Endpoint |
 | --- | --- |
@@ -79,7 +102,11 @@ credentials are enough for `evaluate`/`list`/`status`.
 ## Config file
 
 One YAML file defines named, reusable scopes — a run targets one, several, or
-all of them by name. See
+all of them by name. `--config PATH` points at it explicitly; if omitted,
+`~/.sumo/budget-buddy.yaml` is used when present (same `~/.sumo/` convention
+as [`instances.toml`](#credentials)). See
+[`budget-buddy.example.yaml`](budget-buddy.example.yaml) for a ready-to-copy
+starting point, and
 [`docs/budget-buddy-plan.md`](docs/budget-buddy-plan.md#config-file)
 for the full schema reference; short version:
 
@@ -174,8 +201,7 @@ budget logic.
 ### `sweep` — delete expired budget-buddy-managed budgets
 
 ```
-sumo-budget-buddy sweep [--config PATH] [--scope NAME] [--instance NAME]
-                        [--dry-run] [--force]
+sumo-budget-buddy sweep [--scope NAME] [--instance NAME] [--dry-run] [--force]
 ```
 
 `enforce` always sweeps first on its own, so this is mainly for manual
@@ -206,6 +232,23 @@ sumo-budget-buddy status <budget-id-or-scope_name:key> [--instance NAME]
 Accepts either a raw `/v2/ingestBudgets` ID or `scope_name:key` to resolve via
 the local registry. Shows capacity, usage, and whether it carries the
 budget-buddy marker.
+
+### `instances` — manage `~/.sumo/instances.toml`
+
+```
+sumo-budget-buddy instances list [--format table|json|csv] [--output PATH]
+sumo-budget-buddy instances show <name>
+sumo-budget-buddy instances set <name> [--access-id ID] [--access-key KEY]
+                                        [--endpoint URL] [--ui-base-url URL]
+                                        [--region LABEL] [--description TEXT]
+sumo-budget-buddy instances remove <name>
+```
+
+See [Credentials](#credentials) above — this is just a CLI wrapper around
+that file so you don't have to hand-edit TOML. `show` always masks
+`access_key` completely and only ever shows a short prefix of `access_id`
+(never the full value); `set` only touches the fields you pass, merging with
+whatever's already stored for that instance.
 
 ## How a budget is identified as "ours"
 

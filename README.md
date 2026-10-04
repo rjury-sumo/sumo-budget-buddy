@@ -157,9 +157,9 @@ of this tool.
 ### `evaluate` — read-only volume measurement
 
 ```
-sumo-budget-buddy evaluate (--config PATH (--scope NAME | --all) | --field FIELD --scope-expr EXPR)
+sumo-budget-buddy evaluate (--config PATH (--scope NAME | --all) | [--field FIELD] [--scope-expr EXPR])
                            [--mode per_value|aggregate] [--window WINDOW] [--tz TZ]
-                           [--threshold-bytes N] [--instance NAME]
+                           [--threshold-bytes N] [--instance NAME] [--top N]
                            [--format table|json|csv] [--output PATH]
                            [--log-level TRACE|DEBUG|INFO|WARNING|ERROR]
 ```
@@ -171,8 +171,33 @@ all. Never touches `/v2/ingestBudgets` or the local registry — safe to run
 anytime.
 
 ```bash
+sumo-budget-buddy evaluate --scope-expr "_sourceCategory=*cloudtrail*" --window today
+```
+
+`--field` is only needed when it can't be inferred — `--scope-expr` already
+names it on its left-hand side, so `--field _sourceCategory --scope-expr
+"_sourceCategory=*cloudtrail*"` and just `--scope-expr
+"_sourceCategory=*cloudtrail*"` are equivalent. Field names are matched
+case-insensitively either way (`_sourcecategory` and `_sourceCategory` are the
+same field to Sumo).
+
+Results are always sorted by volume, largest first — `--top N` caps the
+output at the N biggest values, useful for reviewing a wide-open scope before
+deciding what to budget. `--scope-expr` can be omitted too, as long as
+`--field` is given: it then defaults to `<field>=*`, i.e. every value for
+that field. (A bare wildcard is intentionally *not* allowed for a named scope
+in a config file, since those can be targeted by `enforce` — a scope that
+broad is never a valid budget target. The ad-hoc path here is read-only and
+never reaches `enforce`.)
+
+```bash
+# top 20 _sourceCategory values by volume, last 24h, across everything
+sumo-budget-buddy evaluate --field _sourceCategory --window last_24h --top 20
+
+# same, but only values matching a pattern
 sumo-budget-buddy evaluate --field _sourceCategory \
-    --scope-expr "_sourceCategory=*cloudtrail*" --window today
+    --scope-expr "_sourceCategory=*prod*" --window last_24h --top 20 \
+    --format csv --output usage.csv
 ```
 
 ### `enforce` — the one to put on a schedule

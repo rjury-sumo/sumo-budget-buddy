@@ -36,6 +36,16 @@ def test_build_query_aggregate_has_no_group_by():
     assert "sum(gbytes) as gbytes, sum(count) as events" in q
 
 
+def test_build_query_per_value_sorts_by_volume_desc():
+    q = build_query("_sourceCategory", "*cloudtrail*", "per_value")
+    assert "| sort by gbytes desc" in q
+
+
+def test_build_query_aggregate_has_no_sort_clause():
+    q = build_query("_sourceCategory", "*cloudtrail*", "aggregate")
+    assert "sort" not in q
+
+
 def test_build_query_unsupported_field_raises():
     with pytest.raises(UnsupportedFieldError):
         build_query("_notAField", "*x*", "per_value")
@@ -91,6 +101,20 @@ def test_parse_rows_skips_rows_missing_dimension_value_instead_of_defaulting_to_
     rows = parse_rows("_sourceCategory", records, "per_value")
     assert [r.key for r in rows] == ["aws/cloudtrail/logs"]
     assert all(r.key != "*" for r in rows)
+
+
+def test_build_query_accepts_lowercase_field_name():
+    # Sumo treats field names case-insensitively — lowercase/mixed-case input
+    # must resolve to the same canonical dimension as the exact-cased name.
+    q_lower = build_query("_sourcecategory", "*cloudtrail*", "per_value")
+    q_canonical = build_query("_sourceCategory", "*cloudtrail*", "per_value")
+    assert q_lower == q_canonical
+
+
+def test_parse_rows_accepts_lowercase_field_name():
+    records = [{"map": {"sourcecategory": "aws/cloudtrail/logs", "gbytes": "0.1", "events": "5"}}]
+    rows = parse_rows("_SOURCECATEGORY", records, "per_value")
+    assert [r.key for r in rows] == ["aws/cloudtrail/logs"]
 
 
 def test_validate_scope_expr_rejects_bare_wildcard():

@@ -109,6 +109,23 @@ def test_duplicate_scope_name_raises(tmp_path):
         load_config(_write(tmp_path, dup))
 
 
+def test_field_name_is_case_insensitive(tmp_path):
+    # Sumo treats field names case-insensitively; a lowercase field in the
+    # config must not be rejected as "unsupported".
+    cfg_text = 'scopes:\n  - name: x\n    field: _sourcecategory\n    scope: "_sourcecategory=*cloudtrail*"\n'
+    cfg = load_config(_write(tmp_path, cfg_text))
+    assert cfg.scopes["x"].field == "_sourceCategory"
+
+
+def test_scope_config_constructed_directly_allows_global_scope():
+    """The non-global check lives in load_config (config-file scopes, which
+    are reachable from `enforce`), not in ScopeConfig.__post_init__ — a
+    directly-constructed ScopeConfig (as cli.py's ad-hoc `evaluate` path
+    builds) is never enforced, so a bare wildcard is fine here."""
+    cfg = ScopeConfig(name="adhoc", field="_sourceCategory", scope="_sourceCategory=*")
+    assert cfg.scope == "_sourceCategory=*"
+
+
 def test_unknown_key_in_scope_raises(tmp_path):
     bad = MINIMAL.replace("field: _sourceCategory", "field: _sourceCategory\n    bogus_key: 1")
     with pytest.raises(ConfigError):

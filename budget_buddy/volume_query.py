@@ -88,9 +88,25 @@ FIELD_TO_DIM = {
 
 SUPPORTED_FIELDS = tuple(FIELD_TO_DIM)
 
+_LOWER_TO_FIELD = {f.lower(): f for f in FIELD_TO_DIM}
+
 
 class UnsupportedFieldError(ValueError):
     """Raised when a scope's `field` has no free sumologic_volume dimension."""
+
+
+def normalize_field(field: str) -> str:
+    """Case-insensitive lookup of a metadata field name to its canonical
+    (correctly cased) form, e.g. `_sourcecategory` -> `_sourceCategory` — Sumo
+    itself treats field names case-insensitively, so an input's casing should
+    never be a reason to reject it."""
+    canonical = _LOWER_TO_FIELD.get(field.lower())
+    if canonical is None:
+        raise UnsupportedFieldError(
+            f"field {field!r} has no free sumologic_volume dimension — supported: "
+            f"{', '.join(SUPPORTED_FIELDS)}"
+        )
+    return canonical
 
 
 class GlobalScopeError(ValueError):
@@ -131,17 +147,16 @@ def build_query(field: str, filter_glob: str, mode: str) -> str:
     filtered to `filter_glob` (the scope's own wildcard match value, e.g.
     `*cloudtrail*`), grouped per-value (`mode="per_value"`) or summed into a
     single row (`mode="aggregate"`)."""
-    if field not in FIELD_TO_DIM:
-        raise UnsupportedFieldError(
-            f"field {field!r} has no free sumologic_volume dimension — supported: "
-            f"{', '.join(SUPPORTED_FIELDS)}"
-        )
+    field = normalize_field(field)
     if mode not in ("per_value", "aggregate"):
         raise ValueError(f"mode must be 'per_value' or 'aggregate', got {mode!r}")
 
     d = VOLUME_DIMS[FIELD_TO_DIM[field]]
     df = d["dim_field"]
     group_clause = f" by {df}" if mode == "per_value" else ""
+    # Only per_value has multiple output rows to order — aggregate always
+    # collapses to 0 or 1 row, so a sort clause there would be a no-op.
+    sort_clause = "\n| sort by gbytes desc" if mode == "per_value" else ""
 
     return (
         f'_index=sumologic_volume {field}={d["scope"]}\n'
@@ -149,7 +164,7 @@ def build_query(field: str, filter_glob: str, mode: str) -> str:
         f'| json field=data {d["json_alias"]} nodrop\n'
         f'| where tolowercase({df}) matches tolowercase("{filter_glob}")\n'
         f'| bytes/1Gi as gbytes\n'
-        f'| sum(gbytes) as gbytes, sum(count) as events{group_clause}\n'
+        f'| sum(gbytes) as gbytes, sum(count) as events{group_clause}{sort_clause}\n'
     ).rstrip()
 
 
@@ -163,6 +178,7 @@ def parse_rows(field: str, records: list[dict], mode: str) -> list[VolumeRow]:
     rather than given a fallback key — a fallback like `"*"` would silently
     become a global, unconstrained budget scope if that row's volume later
     gets enforced. See docs/dev/budget-buddy-plan.md code-review notes."""
+    field = normalize_field(field)
     d = VOLUME_DIMS[FIELD_TO_DIM[field]]
     key_field = d["dim_key"]  # Sumo lowercases the camelCase alias in output
 

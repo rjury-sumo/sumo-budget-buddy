@@ -12,7 +12,9 @@ from pathlib import Path
 
 import yaml
 
-from budget_buddy.volume_query import SUPPORTED_FIELDS, GlobalScopeError, validate_scope_expr
+from budget_buddy.volume_query import (
+    GlobalScopeError, UnsupportedFieldError, normalize_field, validate_scope_expr,
+)
 
 DEFAULT_THRESHOLD_BYTES = 5 * 1024 ** 3  # 5 GiB
 DEFAULT_MAX_BUDGETS = 50
@@ -57,19 +59,17 @@ class ScopeConfig:
     instance: str = _SCOPE_DEFAULTS["instance"]
 
     def __post_init__(self) -> None:
-        if self.field not in SUPPORTED_FIELDS:
-            raise ConfigError(
-                f"scope {self.name!r}: unsupported field {self.field!r} — "
-                f"supported: {', '.join(SUPPORTED_FIELDS)}"
-            )
-        if not self.scope.startswith(f"{self.field}="):
+        # Sumo treats field names case-insensitively (`_sourcecategory` ==
+        # `_sourceCategory`) — normalize to the canonical casing so input case
+        # is never a reason to reject an otherwise-valid field.
+        try:
+            self.field = normalize_field(self.field)
+        except UnsupportedFieldError as exc:
+            raise ConfigError(f"scope {self.name!r}: {exc}") from exc
+        if not self.scope.lower().startswith(f"{self.field.lower()}="):
             raise ConfigError(
                 f"scope {self.name!r}: `scope` must start with '{self.field}=', got {self.scope!r}"
             )
-        try:
-            validate_scope_expr(self.scope)
-        except GlobalScopeError as exc:
-            raise ConfigError(f"scope {self.name!r}: {exc}") from exc
         if self.mode not in ("per_value", "aggregate"):
             raise ConfigError(f"scope {self.name!r}: mode must be per_value|aggregate")
         if self.budget_type not in ("dailyVolume", "minuteVolume"):
@@ -130,6 +130,15 @@ def load_config(path: str | Path) -> BudgetBuddyConfig:
             raise ConfigError(f"{p}: scope {entry.get('name')!r} has unknown key(s): {unknown}")
 
         scope_cfg = ScopeConfig(**merged)
+        # Config-file scopes are reachable from `enforce`, so the non-global
+        # check runs here at load time (ad-hoc `evaluate` scopes built directly
+        # in cli.py skip this — they're read-only and never reach enforce; see
+        # reconcile.enforce_scope's own pre-create check, the actual last line
+        # of defense against a global-scope budget).
+        try:
+            validate_scope_expr(scope_cfg.scope)
+        except GlobalScopeError as exc:
+            raise ConfigError(f"scope {scope_cfg.name!r}: {exc}") from exc
         if scope_cfg.name in scopes:
             raise ConfigError(f"{p}: duplicate scope name {scope_cfg.name!r}")
         if scope_cfg.mode == "aggregate" and "max_budgets" in entry:

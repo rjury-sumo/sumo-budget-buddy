@@ -60,8 +60,11 @@ def _config_scope_args(p: argparse.ArgumentParser) -> None:
 
 
 def _adhoc_scope_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--field", help="ad-hoc mode: metadata field, e.g. _sourceCategory")
-    p.add_argument("--scope-expr", help='ad-hoc mode: e.g. "_sourceCategory=*cloudtrail*"')
+    p.add_argument("--field", help="ad-hoc mode: metadata field, e.g. _sourceCategory; "
+                                    "inferred from --scope-expr's left-hand side if omitted")
+    p.add_argument("--scope-expr",
+                    help='ad-hoc mode: e.g. "_sourceCategory=*cloudtrail*"; '
+                         'defaults to "<field>=*" (every value) if omitted')
     p.add_argument("--mode", choices=["per_value", "aggregate"], default="per_value")
     p.add_argument("--window", default="today")
     p.add_argument("--tz", default="America/Los_Angeles")
@@ -77,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval = sub.add_parser("evaluate", parents=[common], help="measure volume, no mutation")
     _config_scope_args(p_eval)
     _adhoc_scope_args(p_eval)
+    p_eval.add_argument("--top", type=int, metavar="N",
+                         help="keep only the N largest rows (by bytes, after sorting)")
     p_eval.add_argument("--format", choices=["table", "json", "csv"])
     p_eval.add_argument("--output")
 
@@ -149,13 +154,27 @@ def _resolve_scopes(args) -> list[ScopeConfig]:
             logger.warning(w)
         return select_scopes(cfg, args.scopes, args.all)
 
-    if not args.field or not args.scope_expr:
-        raise ConfigError(
-            "either --config (with --scope/--all), a config file at "
-            f"{DEFAULT_CONFIG_PATH}, or --field + --scope-expr is required"
-        )
+    field = args.field
+    scope_expr = args.scope_expr
+    if not field:
+        # --field is redundant when --scope-expr already names it on its
+        # left-hand side, e.g. "_sourceCategory=*cloudtrail*" — infer rather
+        # than make the caller repeat it.
+        if scope_expr and "=" in scope_expr:
+            field, _, _ = scope_expr.partition("=")
+        else:
+            raise ConfigError(
+                "either --config (with --scope/--all), a config file at "
+                f"{DEFAULT_CONFIG_PATH}, --field, or a --scope-expr of the form "
+                "'<field>=<value>' (field is inferred from it) is required"
+            )
+    # --scope-expr is optional in ad-hoc mode: this scope is read-only
+    # (evaluate never reaches enforce), so "every value for this field" is a
+    # legitimate ask here, unlike a config-file scope that could later be
+    # enforced against — see config.py's load_config for that check.
+    scope_expr = scope_expr or f"{field}=*"
     return [ScopeConfig(
-        name="adhoc", field=args.field, scope=args.scope_expr, mode=args.mode,
+        name="adhoc", field=field, scope=scope_expr, mode=args.mode,
         window=args.window, tz=args.tz, threshold_bytes=args.threshold_bytes,
         instance=args.instance,
     )]
@@ -173,6 +192,12 @@ def cmd_evaluate(args) -> int:
                 "events": r.events, "threshold_bytes": r.threshold_bytes,
                 "over_threshold": r.over_threshold, "window": r.window, "tz": r.tz,
             })
+    # build_query already sorts per_value server-side, but re-sort here too:
+    # multiple scopes (--all) or aggregate rows interleave in scope order, not
+    # volume order, once combined into one table.
+    rows.sort(key=lambda r: r["bytes"], reverse=True)
+    if args.top:
+        rows = rows[: args.top]
     fmt = infer_format(args.output, args.format)
     columns = ["scope", "key", "gb", "events", "threshold_bytes", "over_threshold", "window", "tz"]
     render_rows(rows, columns, fmt=fmt, output=args.output, title="evaluate")

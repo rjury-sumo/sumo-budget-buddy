@@ -53,6 +53,23 @@ def test_adhoc_args_used_when_no_config_present(tmp_path, monkeypatch):
     assert [s.name for s in scopes] == ["adhoc"]
 
 
+def test_adhoc_scope_expr_defaults_to_bare_wildcard_for_field(tmp_path, monkeypatch):
+    """--field with no --scope-expr means "every value for this field" —
+    the read-only ad-hoc evaluate path, unlike a config-file scope, is never
+    reachable from enforce so this is safe to allow."""
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", tmp_path / "missing.yaml")
+    scopes = cli._resolve_scopes(_args(field="_sourceCategory"))
+    assert [s.scope for s in scopes] == ["_sourceCategory=*"]
+
+
+def test_adhoc_field_inferred_from_scope_expr_when_omitted(tmp_path, monkeypatch):
+    """--scope-expr already names the field on its left-hand side, so
+    --field is redundant and shouldn't be required."""
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", tmp_path / "missing.yaml")
+    scopes = cli._resolve_scopes(_args(scope_expr="_sourceCategory=*cloudtrail*"))
+    assert [(s.field, s.scope) for s in scopes] == [("_sourceCategory", "_sourceCategory=*cloudtrail*")]
+
+
 def test_error_message_names_default_path_when_nothing_given(tmp_path, monkeypatch):
     default_path = tmp_path / "missing.yaml"
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", default_path)

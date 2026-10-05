@@ -81,6 +81,12 @@ class ScopeConfig:
             raise ConfigError(f"scope {self.name!r}: budget_type must be dailyVolume|minuteVolume")
         if self.action not in ("stopCollecting", "keepCollecting"):
             raise ConfigError(f"scope {self.name!r}: action must be stopCollecting|keepCollecting")
+        if self.ttl != "end_of_day":
+            # "end_of_day" is the only TTL reconcile.enforce_scope actually
+            # implements (via timerange.end_of_day) — reject anything else at
+            # load time rather than silently ignoring a value the operator
+            # explicitly configured.
+            raise ConfigError(f"scope {self.name!r}: ttl must be 'end_of_day' (the only supported value)")
         if self.threshold_bytes <= 0:
             raise ConfigError(f"scope {self.name!r}: threshold_bytes must be > 0")
         if self.budget_capacity_bytes is None:

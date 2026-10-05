@@ -353,10 +353,13 @@ otherwise no way to undo a mistaken `enforce` before end-of-day. `delete`
 fills that gap: it deletes one budget immediately (by raw ID or
 `scope_name:key`, same resolution as `status`) and forgets its registry
 entry if there is one. It refuses to touch a budget whose description
-doesn't carry the `[managed-by=budget-buddy]` marker — `--force` overrides
-that guardrail for a budget that's unmanaged or whose marker doesn't match
-(use with care: unlike `enforce`/`sweep`'s `--force`, which only clears a
-stale lock, this one bypasses the "is this actually ours" check).
+doesn't carry the `[managed-by=budget-buddy]` marker, or — when given a
+`scope_name:key` target — whose marker doesn't match that exact scope/key
+(the same check `sweep` applies before its own deletes). `--force`
+overrides that guardrail (use with care: it bypasses the "is this actually
+ours" check) and, like `enforce`/`sweep`'s `--force`, also clears a stale
+concurrency lock. Exits `3` (not the generic usage-error `2`) when refused
+for a marker mismatch, so a wrapper script can tell the two apart.
 
 ### `instances` — manage `~/.sumo/instances.toml`
 

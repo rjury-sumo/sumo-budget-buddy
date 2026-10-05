@@ -63,16 +63,9 @@ class SearchClient:
 
     def _check(self, resp: requests.Response, operation: str) -> dict:
         logger.debug("%s -> HTTP %s", operation, resp.status_code)
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as exc:
-            try:
-                detail = resp.json()
-            except ValueError:
-                detail = resp.text
-            raise SearchError(f"{operation} failed: HTTP {resp.status_code} - {detail}",
-                               status_code=resp.status_code) from exc
-        return resp.json() if resp.text.strip() else {}
+        make_error = lambda status_code, detail, op: SearchError(  # noqa: E731
+            f"{op} failed: HTTP {status_code} - {detail}", status_code=status_code)
+        return _http.check_response(resp, operation, make_error)
 
     def _request(self, method: str, path: str, *, params=None, json_body=None, operation: str = "") -> dict:
         url = f"{self.base}{path}"

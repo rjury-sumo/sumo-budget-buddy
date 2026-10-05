@@ -104,6 +104,25 @@ def test_get_active_returns_none_when_missing(tmp_path, monkeypatch):
     assert reg.get_active("s1", "nope") is None
 
 
+def test_malformed_entry_is_skipped_not_crashed_on(tmp_path, monkeypatch):
+    # Regression: RegistryEntry(**v) for a shape-mismatched entry (missing/
+    # extra field from a half-applied schema change or manual edit) used to
+    # raise an uncaught TypeError out of Registry(), crashing every command
+    # that constructs one. Only the malformed entry should be skipped.
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    reg = Registry("default")
+    reg.put(_entry(scope="s1", key="k1"))
+    reg.save()
+    import json
+    raw = json.loads(reg.path.read_text())
+    raw["entries"]["s2:k2"] = {"budget_id": "BID2", "scope_name": "s2"}  # missing required fields
+    reg.path.write_text(json.dumps(raw))
+
+    reloaded = Registry("default")
+    assert reloaded.get("s1", "k1") is not None
+    assert reloaded.get("s2", "k2") is None
+
+
 def test_instances_are_isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
     a = Registry("alpha")

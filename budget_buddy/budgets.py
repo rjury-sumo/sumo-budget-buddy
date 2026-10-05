@@ -74,15 +74,7 @@ class IngestBudgetsV2Client:
 
     def _check(self, resp: requests.Response, operation: str) -> dict:
         logger.debug("%s -> HTTP %s", operation, resp.status_code)
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as exc:
-            try:
-                detail = resp.json()
-            except ValueError:
-                detail = resp.text
-            raise BudgetAPIError(resp.status_code, str(detail), operation) from exc
-        return resp.json() if resp.text.strip() else {}
+        return _http.check_response(resp, operation, BudgetAPIError)
 
     def _request(self, method: str, path: str, *, params=None, json_body=None, operation: str = "") -> dict:
         url = f"{self.base}{path}"
@@ -137,7 +129,3 @@ class IngestBudgetsV2Client:
         if resp.status_code not in (200, 204):
             self._check(resp, f"delete budget ({budget_id})")
         return True
-
-    def reset_usage(self, budget_id: str) -> None:
-        self._request("post", f"/ingestBudgets/{budget_id}/usage/reset",
-                       operation=f"reset usage ({budget_id})")

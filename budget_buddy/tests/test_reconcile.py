@@ -466,6 +466,73 @@ def test_delete_budget_already_gone_404_forgets_registry_entry(tmp_path, monkeyp
     assert reloaded.get("s1", "k1") is None
 
 
+def test_delete_budget_by_scope_name_key_refuses_on_marker_mismatch(tmp_path, monkeypatch):
+    # Regression: a scope_name:key target must verify the live marker
+    # actually matches THAT scope/key, not just that some budget-buddy
+    # marker is present — otherwise a stale/corrupted registry entry could
+    # delete a live, unrelated budget that happens to carry a valid marker
+    # for a different scope/key. Mirrors sweep_registry's verify_marker use.
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    registry.put(_registry_entry("s1", "k1", "B1", expires_in_hours=10.0))
+    registry.save()
+    budgets = FakeBudgetsClient()
+    budgets.budgets["B1"] = _managed_budget("B1", "s2", "other-key")  # wrong scope/key
+
+    result = reconcile.delete_budget("s1:k1", budgets, registry)
+
+    assert result.action == "skipped_marker_mismatch"
+    assert "B1" in budgets.budgets  # never deleted
+    reloaded = Registry("default")
+    assert reloaded.get("s1", "k1") is not None  # left in place, not forgotten
+
+
+def test_delete_budget_by_scope_name_key_marker_mismatch_force_overrides(tmp_path, monkeypatch):
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    registry.put(_registry_entry("s1", "k1", "B1", expires_in_hours=10.0))
+    registry.save()
+    budgets = FakeBudgetsClient()
+    budgets.budgets["B1"] = _managed_budget("B1", "s2", "other-key")
+
+    result = reconcile.delete_budget("s1:k1", budgets, registry, force=True)
+
+    assert result.action == "deleted"
+    assert "B1" not in budgets.budgets
+
+
+def test_sweep_registry_delete_failure_keeps_entry_for_retry(tmp_path, monkeypatch):
+    # Regression: a failure from the DELETE call itself (not just the GET
+    # check above it) must be caught and reported as "error", leaving the
+    # entry in the registry for next cycle's retry — not propagate and
+    # abort the whole sweep/enforce run over one flaky delete.
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    registry.put(_registry_entry("s1", "k1", "B1", expires_in_hours=-1.0))
+    registry.save()
+    budgets = FakeBudgetsClient()
+    desc = naming.build_description("s1", "k1", "_sourceCategory",
+                                     datetime.now(timezone.utc), datetime.now(timezone.utc))
+    budgets.budgets["B1"] = IngestBudget(
+        id="B1", name="bb:s1:k1", scope="_sourceCategory=k1", capacity_bytes=1000,
+        action="stopCollecting", budget_type="dailyVolume", description=desc,
+        timezone="UTC", reset_time="00:00", audit_threshold=85, usage_bytes=0,
+        usage_status="Normal", created_at="", modified_at="",
+    )
+
+    def _boom(budget_id):
+        raise ConnectionError("network is down")
+
+    budgets.delete_budget = _boom
+
+    results = reconcile.sweep_registry(registry, budgets)
+
+    assert [r.action for r in results] == ["error"]
+    assert "B1" in budgets.budgets  # delete never actually happened
+    reloaded = Registry("default")
+    assert reloaded.get("s1", "k1") is not None  # still tracked for next cycle
+
+
 def test_delete_budget_dry_run_does_not_mutate(tmp_path, monkeypatch):
     monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
     registry = Registry("default")

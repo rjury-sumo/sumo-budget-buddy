@@ -66,6 +66,17 @@ def endpoint_for_region(region: str | None) -> str | None:
     return REGION_ENDPOINTS.get(region.strip().upper())
 
 
+def _resolve_endpoint(cfg: dict, sfx: str) -> str:
+    """env var -> config file -> region -> built-in default, then
+    normalized. Shared by instance_status and resolve_instance so the two
+    can't drift on how an endpoint is derived (resolve_instance additionally
+    validates the scheme — see there)."""
+    return (os.environ.get(f"SUMO_ENDPOINT{sfx}")
+            or cfg.get("endpoint")
+            or endpoint_for_region(cfg.get("region"))
+            or DEFAULT_ENDPOINT).rstrip("/")
+
+
 # Load .env once at import time — optional dependency, harmless if absent.
 try:
     from dotenv import load_dotenv
@@ -114,10 +125,7 @@ def instance_status(name: str, cfg: dict | None = None) -> dict:
     key_env = os.environ.get(f"SUMO_ACCESS_KEY{sfx}")
     access_id = id_env or cfg.get("access_id")
     access_key = key_env or cfg.get("access_key")
-    endpoint = (os.environ.get(f"SUMO_ENDPOINT{sfx}")
-                or cfg.get("endpoint")
-                or endpoint_for_region(cfg.get("region"))
-                or DEFAULT_ENDPOINT)
+    endpoint = _resolve_endpoint(cfg, sfx)
 
     def _src(env_val, cfg_val):
         if env_val:
@@ -239,10 +247,7 @@ def resolve_instance(name: str) -> dict:
 
     access_id = os.environ.get(f"SUMO_ACCESS_ID{sfx}") or cfg.get("access_id")
     access_key = os.environ.get(f"SUMO_ACCESS_KEY{sfx}") or cfg.get("access_key")
-    endpoint = (os.environ.get(f"SUMO_ENDPOINT{sfx}")
-                or cfg.get("endpoint")
-                or endpoint_for_region(cfg.get("region"))
-                or DEFAULT_ENDPOINT).rstrip("/")
+    endpoint = _resolve_endpoint(cfg, sfx)
     if not endpoint.startswith("https://"):
         raise SystemExit(
             f"SUMO_ENDPOINT must use https://. Got: {endpoint!r}\n"

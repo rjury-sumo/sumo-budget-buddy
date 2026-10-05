@@ -77,10 +77,29 @@ def build_name(scope_name: str, key: str, expires_at: datetime) -> str:
 def build_description(scope_name: str, key: str, field: str,
                        created_at: datetime, expires_at: datetime,
                        extra: str | None = None) -> str:
-    desc = (
-        f"[{MARKER_TAG}] scope={json.dumps(scope_name)} key={json.dumps(key)} field={field} "
-        f"created={created_at.isoformat()} expires={expires_at.isoformat()}"
-    )
+    head = f"[{MARKER_TAG}] scope={json.dumps(scope_name)} key="
+    tail = (f" field={field} created={created_at.isoformat()} "
+            f"expires={expires_at.isoformat()}")
+    key_json = json.dumps(key)
+
+    if len(head) + len(key_json) + len(tail) > 1024:
+        # Truncate only the key, never the fixed trailing fields _MARKER_RE
+        # requires intact — a blind desc[:1024] slice could land mid-field
+        # and make this marker permanently unparseable (see parse_marker),
+        # leaving the budget un-sweepable forever. Append a short content
+        # hash so two long keys sharing a prefix still produce distinct,
+        # round-trippable markers, mirroring build_name's approach.
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+        budget_for_key_json = 1024 - len(head) - len(tail)
+        truncated_key = key
+        while truncated_key:
+            candidate_json = json.dumps(f"{truncated_key}~{digest}")
+            if len(candidate_json) <= budget_for_key_json:
+                break
+            truncated_key = truncated_key[:-1]
+        key_json = json.dumps(f"{truncated_key}~{digest}" if truncated_key else f"~{digest}")
+
+    desc = f"{head}{key_json}{tail}"
     if extra:
         desc = f"{desc} {extra}"
     return desc[:1024]

@@ -141,3 +141,14 @@ def test_validate_scope_expr_accepts_narrowing_patterns():
     validate_scope_expr("_sourceCategory=*cloudtrail*")
     validate_scope_expr("_sourceCategory=aws/cloudtrail/logs")
     validate_scope_expr("_sourceCategory=test/foo/*")
+
+
+def test_build_query_escapes_embedded_quote_in_filter_glob():
+    # Regression: filter_glob was spliced into a double-quoted query literal
+    # unescaped — a value containing a literal `"` could break out of the
+    # string or alter the query's meaning.
+    q = build_query("_sourceCategory", 'foo"bar', "per_value")
+    assert 'tolowercase("foo\\"bar")' in q
+    # The quote must not appear unescaped (which would terminate the string
+    # literal early).
+    assert 'tolowercase("foo"bar")' not in q

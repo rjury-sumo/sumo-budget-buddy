@@ -537,12 +537,16 @@ sumo-budget-buddy delete     <id-or-scope-name:value> [--instance NAME]
                               # fix-up path for undoing a mistaken enforce:
                               # deletes one budget directly, bypassing TTL.
                               # Refuses unless the live description carries
-                              # the [managed-by=budget-buddy] marker, same
-                              # check sweep applies before its own deletes —
-                              # --force here overrides *that* guardrail (not
-                              # a lock override, unlike enforce/sweep's
-                              # --force — this command takes no lock since
-                              # it targets one ID, not the whole registry).
+                              # the [managed-by=budget-buddy] marker AND (when
+                              # given scope_name:key) that marker's scope/key
+                              # exactly match — the same naming.verify_marker
+                              # check sweep applies before its own deletes.
+                              # --force overrides that guardrail AND clears a
+                              # stale lock, same as enforce/sweep's --force.
+                              # Takes the per-instance lock like enforce/sweep
+                              # do (Registry.save() rewrites the whole file,
+                              # not a per-key patch, so even a single-ID
+                              # delete needs the same cross-process exclusion).
                               # Also forgets the registry entry, if any.
 
 sumo-budget-buddy instances  list | show <name> | set <name> [FIELDS...] | remove <name>

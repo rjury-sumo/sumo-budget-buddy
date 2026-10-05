@@ -8,11 +8,14 @@ before any mutating call.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
 from budget_buddy.paths import registry_file
+
+logger = logging.getLogger("budget_buddy.registry")
 
 
 @dataclass
@@ -28,6 +31,18 @@ class RegistryEntry:
 
 def _entry_key(scope_name: str, key: str) -> str:
     return f"{scope_name}:{key}"
+
+
+def split_scope_key(target: str) -> tuple[str, str] | None:
+    """Inverse of `_entry_key`: split a `scope_name:key` CLI target (e.g.
+    from `status`/`delete`) into its two halves, or None if `target` doesn't
+    carry a `:` (i.e. it's a raw budget ID instead). Shared by cmd_status
+    (cli.py) and delete_budget (reconcile.py) so the convention can't drift
+    between the two independently."""
+    if ":" not in target:
+        return None
+    scope_name, _, key = target.partition(":")
+    return scope_name, key
 
 
 class Registry:
@@ -49,7 +64,17 @@ class Registry:
         except (json.JSONDecodeError, OSError):
             self._entries = {}
             return
-        self._entries = {k: RegistryEntry(**v) for k, v in raw.get("entries", {}).items()}
+        entries: dict[str, RegistryEntry] = {}
+        for k, v in raw.get("entries", {}).items():
+            try:
+                entries[k] = RegistryEntry(**v)
+            except TypeError:
+                # Shape doesn't match RegistryEntry (half-applied schema
+                # migration, stray manual edit, etc.) — skip just this one
+                # entry rather than raising and crashing every command that
+                # constructs a Registry, or silently dropping every entry.
+                logger.warning("registry %s: skipping malformed entry %r: %s", self.path, k, v)
+        self._entries = entries
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

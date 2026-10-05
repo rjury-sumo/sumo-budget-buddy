@@ -52,6 +52,29 @@ class Throttle:
         self._last = time.monotonic()
 
 
+def check_response(resp, operation: str, raise_error):
+    """Shared `raise_for_status` + JSON/text error-detail extraction for
+    budget_buddy's REST clients (search.py, budgets.py) — their `_check`
+    methods were previously near-identical copies of this logic, each with
+    its own client-specific exception type. `raise_error(status_code,
+    detail, operation)` builds and raises that client's exception; this
+    function only owns the (status_code, detail) extraction shared by both.
+
+    Operates purely on a duck-typed response object (`.raise_for_status()`,
+    `.status_code`, `.json()`, `.text`) — no `requests` import needed here,
+    consistent with this module having no `requests` dependency of its own.
+    """
+    try:
+        resp.raise_for_status()
+    except Exception as exc:  # requests.HTTPError, without importing requests here
+        try:
+            detail = resp.json()
+        except ValueError:
+            detail = resp.text
+        raise raise_error(resp.status_code, str(detail), operation) from exc
+    return resp.json() if resp.text.strip() else {}
+
+
 def retry_after_seconds(resp) -> float | None:
     """Parse a numeric `Retry-After` header (seconds) from a response, or None."""
     try:

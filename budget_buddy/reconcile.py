@@ -13,15 +13,22 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 
 from budget_buddy import naming
 from budget_buddy.budgets import BudgetAPIError, IngestBudgetsV2Client
 from budget_buddy.config import ScopeConfig
 from budget_buddy.instance_config import resolve_instance
-from budget_buddy.registry import Registry, RegistryEntry
+from budget_buddy.registry import Registry, RegistryEntry, split_scope_key
 from budget_buddy.search import SearchClient
 from budget_buddy.timerange import end_of_day, resolve_window
-from budget_buddy.volume_query import GlobalScopeError, build_query, parse_rows, validate_scope_expr
+from budget_buddy.volume_query import (
+    GlobalScopeError,
+    build_query,
+    parse_rows,
+    parse_scope_expr,
+    validate_scope_expr,
+)
 
 logger = logging.getLogger("budget_buddy.reconcile")
 
@@ -40,13 +47,24 @@ class EvaluationRow:
     tz: str
 
 
+class ActionKind(str, Enum):
+    CREATED = "created"
+    SKIPPED_EXISTING = "skipped_existing"
+    SKIPPED_INVALID_SCOPE = "skipped_invalid_scope"
+    SWEPT = "swept"
+    SWEPT_ALREADY_GONE = "swept_already_gone"
+    SKIPPED_MARKER_MISMATCH = "skipped_marker_mismatch"
+    CAPPED_UNCOVERED = "capped_uncovered"
+    ERROR = "error"
+    DELETED = "deleted"
+    ALREADY_GONE = "already_gone"
+
+
 @dataclass
 class ActionResult:
     scope_name: str
     key: str
-    action: str  # created | skipped_existing | skipped_invalid_scope | swept |
-                 # swept_already_gone | skipped_marker_mismatch | capped_uncovered | error |
-                 # deleted | already_gone
+    action: ActionKind
     budget_id: str | None = None
     bytes: int | None = None
     detail: str = ""
@@ -71,8 +89,7 @@ class ClientCache:
 
 def _glob_value(scope_expr: str) -> str:
     """`_sourceCategory=*cloudtrail*` -> `*cloudtrail*`."""
-    _, _, value = scope_expr.partition("=")
-    return value
+    return parse_scope_expr(scope_expr)[1]
 
 
 def evaluate_scope(scope: ScopeConfig, search_client: SearchClient, *,
@@ -117,7 +134,7 @@ def sweep_registry(registry: Registry, budgets_client: IngestBudgetsV2Client, *,
         if scope_names is not None and entry.scope_name not in scope_names:
             continue
         if dry_run:
-            results.append(ActionResult(entry.scope_name, entry.key, "swept",
+            results.append(ActionResult(entry.scope_name, entry.key, ActionKind.SWEPT,
                                          budget_id=entry.budget_id, detail="dry-run, not deleted"))
             continue
 
@@ -133,7 +150,7 @@ def sweep_registry(registry: Registry, budgets_client: IngestBudgetsV2Client, *,
                             entry.budget_id)
                 registry.remove(entry.scope_name, entry.key)
                 registry.save()
-                results.append(ActionResult(entry.scope_name, entry.key, "swept_already_gone",
+                results.append(ActionResult(entry.scope_name, entry.key, ActionKind.SWEPT_ALREADY_GONE,
                                              budget_id=entry.budget_id))
             else:
                 # Anything else (401/403/500/...) is NOT confirmation the budget
@@ -143,7 +160,7 @@ def sweep_registry(registry: Registry, budgets_client: IngestBudgetsV2Client, *,
                     "sweep: GET budget %s failed (HTTP %s) — leaving in registry to retry next "
                     "cycle: %s", entry.budget_id, exc.status_code, exc,
                 )
-                results.append(ActionResult(entry.scope_name, entry.key, "error",
+                results.append(ActionResult(entry.scope_name, entry.key, ActionKind.ERROR,
                                              budget_id=entry.budget_id, detail=str(exc)))
             continue
         except Exception as exc:  # noqa: BLE001 - transport/network failure, not an API response
@@ -151,7 +168,7 @@ def sweep_registry(registry: Registry, budgets_client: IngestBudgetsV2Client, *,
                 "sweep: could not reach API to check budget %s — leaving in registry to retry "
                 "next cycle: %s", entry.budget_id, exc,
             )
-            results.append(ActionResult(entry.scope_name, entry.key, "error",
+            results.append(ActionResult(entry.scope_name, entry.key, ActionKind.ERROR,
                                          budget_id=entry.budget_id, detail=str(exc)))
             continue
 
@@ -162,16 +179,29 @@ def sweep_registry(registry: Registry, budgets_client: IngestBudgetsV2Client, *,
                 "(scope=%s key=%s) — SKIPPING delete for safety", entry.budget_id,
                 entry.scope_name, entry.key,
             )
-            results.append(ActionResult(entry.scope_name, entry.key, "skipped_marker_mismatch",
+            results.append(ActionResult(entry.scope_name, entry.key, ActionKind.SKIPPED_MARKER_MISMATCH,
                                          budget_id=entry.budget_id,
                                          detail="live description marker did not match registry"))
             continue
 
-        deleted = budgets_client.delete_budget(entry.budget_id)
+        # Guarded like the get_budget call above: a failure here (429/5xx/
+        # network) must leave the entry in the registry for next cycle's
+        # retry, not crash the whole sweep/enforce run over one bad delete.
+        try:
+            deleted = budgets_client.delete_budget(entry.budget_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "sweep: DELETE budget %s failed — leaving in registry to retry next cycle: %s",
+                entry.budget_id, exc,
+            )
+            results.append(ActionResult(entry.scope_name, entry.key, ActionKind.ERROR,
+                                         budget_id=entry.budget_id, detail=str(exc)))
+            continue
+
         registry.remove(entry.scope_name, entry.key)
         registry.save()
-        action = "swept" if deleted else "swept_already_gone"
-        logger.info("sweep %s: budget_id=%s scope=%s key=%s", action, entry.budget_id,
+        action = ActionKind.SWEPT if deleted else ActionKind.SWEPT_ALREADY_GONE
+        logger.info("sweep %s: budget_id=%s scope=%s key=%s", action.value, entry.budget_id,
                    entry.scope_name, entry.key)
         results.append(ActionResult(entry.scope_name, entry.key, action, budget_id=entry.budget_id))
 
@@ -195,7 +225,7 @@ def enforce_scope(scope: ScopeConfig, search_client: SearchClient,
         # unprotected forever. See registry.get_active's docstring.
         existing = registry.get_active(scope.name, row.key, now=now)
         if existing is not None:
-            results.append(ActionResult(scope.name, row.key, "skipped_existing",
+            results.append(ActionResult(scope.name, row.key, ActionKind.SKIPPED_EXISTING,
                                          budget_id=existing.budget_id, bytes=row.bytes,
                                          detail="already has a non-expired budget this cycle"))
             logger.info("enforce skipped_existing scope=%s key=%s budget_id=%s",
@@ -216,7 +246,7 @@ def enforce_scope(scope: ScopeConfig, search_client: SearchClient,
                 "enforce: refusing to create a global-scope budget for scope=%s key=%r: %s",
                 scope.name, row.key, exc,
             )
-            results.append(ActionResult(scope.name, row.key, "skipped_invalid_scope",
+            results.append(ActionResult(scope.name, row.key, ActionKind.SKIPPED_INVALID_SCOPE,
                                          bytes=row.bytes, detail=str(exc)))
             continue
 
@@ -224,7 +254,7 @@ def enforce_scope(scope: ScopeConfig, search_client: SearchClient,
         description = naming.build_description(scope.name, row.key, scope.field, now, expires_at)
 
         if dry_run:
-            results.append(ActionResult(scope.name, row.key, "created", bytes=row.bytes,
+            results.append(ActionResult(scope.name, row.key, ActionKind.CREATED, bytes=row.bytes,
                                          detail=f"dry-run: would create {name!r} scope={budget_scope_expr!r} "
                                                 f"capacity={scope.budget_capacity_bytes}"))
             continue
@@ -238,7 +268,7 @@ def enforce_scope(scope: ScopeConfig, search_client: SearchClient,
         except Exception as exc:  # noqa: BLE001 - report and continue with remaining offenders
             logger.error("enforce: create_budget failed for scope=%s key=%s: %s",
                         scope.name, row.key, exc)
-            results.append(ActionResult(scope.name, row.key, "error", bytes=row.bytes, detail=str(exc)))
+            results.append(ActionResult(scope.name, row.key, ActionKind.ERROR, bytes=row.bytes, detail=str(exc)))
             continue
 
         registry.put(RegistryEntry(
@@ -251,7 +281,7 @@ def enforce_scope(scope: ScopeConfig, search_client: SearchClient,
         logger.info("enforce created scope=%s key=%s budget_id=%s bytes=%d capacity=%d expires=%s",
                    scope.name, row.key, created.id, row.bytes, scope.budget_capacity_bytes,
                    expires_at.isoformat())
-        results.append(ActionResult(scope.name, row.key, "created", budget_id=created.id, bytes=row.bytes))
+        results.append(ActionResult(scope.name, row.key, ActionKind.CREATED, budget_id=created.id, bytes=row.bytes))
 
     uncovered = offenders[scope.max_budgets:]
     for row in uncovered:
@@ -259,7 +289,7 @@ def enforce_scope(scope: ScopeConfig, search_client: SearchClient,
             "enforce: scope=%s max_budgets=%d reached — key=%s (bytes=%d) left uncovered this cycle",
             scope.name, scope.max_budgets, row.key, row.bytes,
         )
-        results.append(ActionResult(scope.name, row.key, "capped_uncovered", bytes=row.bytes,
+        results.append(ActionResult(scope.name, row.key, ActionKind.CAPPED_UNCOVERED, bytes=row.bytes,
                                      detail=f"max_budgets={scope.max_budgets} reached"))
 
     return results
@@ -282,17 +312,20 @@ def delete_budget(target: str, budgets_client: IngestBudgetsV2Client, registry: 
     the registry) — the fix-up path for undoing a mistaken `enforce`, since
     `sweep` only ever touches entries already past their TTL and there is
     otherwise no way to remove a budget early. Refuses to delete anything
-    that doesn't carry the budget-buddy description marker unless `force` is
-    set, so this can't be pointed at an unrelated org budget by accident —
-    the same defensive check `sweep_registry` applies before its own deletes.
+    whose live description marker doesn't carry the budget-buddy tag, or
+    (when the target named a scope/key) doesn't match that scope/key, unless
+    `force` is set — the same defensive check `sweep_registry` applies
+    (naming.verify_marker) before its own deletes.
     """
     scope_name, key = "", target
     budget_id = target
-    if ":" in target:
-        scope_name, _, key = target.partition(":")
+    split = split_scope_key(target)
+    known_target = split is not None
+    if known_target:
+        scope_name, key = split
         entry = registry.get(scope_name, key)
         if entry is None:
-            return ActionResult(scope_name, key, "error", detail=f"no registry entry for {target!r}")
+            return ActionResult(scope_name, key, ActionKind.ERROR, detail=f"no registry entry for {target!r}")
         budget_id = entry.budget_id
 
     try:
@@ -300,22 +333,30 @@ def delete_budget(target: str, budgets_client: IngestBudgetsV2Client, registry: 
     except BudgetAPIError as exc:
         if exc.status_code == 404:
             _forget(registry, budget_id)
-            return ActionResult(scope_name, key, "already_gone", budget_id=budget_id)
-        return ActionResult(scope_name, key, "error", budget_id=budget_id, detail=str(exc))
+            return ActionResult(scope_name, key, ActionKind.ALREADY_GONE, budget_id=budget_id)
+        return ActionResult(scope_name, key, ActionKind.ERROR, budget_id=budget_id, detail=str(exc))
 
-    marker = naming.parse_marker(live.description)
-    if marker is not None and not scope_name:
-        scope_name, key = marker.scope_name, marker.key
+    if known_target:
+        # The target named a scope/key — require an exact match, same as
+        # sweep, not just "some marker is present" (a mismatch here would
+        # otherwise let a stale/corrupted registry entry delete an unrelated
+        # budget that happens to carry a valid marker for a different key).
+        matches = naming.verify_marker(live.description, expected_scope=scope_name, expected_key=key)
+    else:
+        marker = naming.parse_marker(live.description)
+        matches = marker is not None
+        if matches:
+            scope_name, key = marker.scope_name, marker.key
 
-    if marker is None and not force:
-        return ActionResult(scope_name, key, "skipped_marker_mismatch", budget_id=budget_id,
-                             detail="no budget-buddy marker on this budget's description — "
+    if not matches and not force:
+        return ActionResult(scope_name, key, ActionKind.SKIPPED_MARKER_MISMATCH, budget_id=budget_id,
+                             detail="live description marker did not match the expected scope/key — "
                                     "pass force=True to override")
 
     if dry_run:
-        return ActionResult(scope_name, key, "deleted", budget_id=budget_id,
+        return ActionResult(scope_name, key, ActionKind.DELETED, budget_id=budget_id,
                              detail=f"dry-run: would delete (name={live.name!r})")
 
     budgets_client.delete_budget(budget_id)
     _forget(registry, budget_id)
-    return ActionResult(scope_name, key, "deleted", budget_id=budget_id, detail=f"name={live.name!r}")
+    return ActionResult(scope_name, key, ActionKind.DELETED, budget_id=budget_id, detail=f"name={live.name!r}")

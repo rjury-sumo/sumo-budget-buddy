@@ -71,6 +71,29 @@ def test_build_description_escapes_whitespace_in_scope_name():
     assert marker.scope_name == "scope with spaces"
 
 
+def test_build_description_truncates_long_key_without_breaking_the_marker():
+    # Regression: a blind desc[:1024] slice could land mid-field (e.g. cut
+    # "expires=..." short), making verify_marker reject the budget forever.
+    # Truncating the key instead must keep the marker fully parseable.
+    long_key = "aws/observability/cloudtrail/" + "x" * 2000
+    desc = build_description("scope1", long_key, "_sourceCategory", CREATED, EXP)
+    assert len(desc) <= 1024
+    marker = parse_marker(desc)
+    assert marker is not None
+    assert marker.field == "_sourceCategory"
+    assert marker.created_at == CREATED.isoformat()
+    assert marker.expires_at == EXP.isoformat()
+    assert marker.key != long_key  # truncated
+    assert marker.key.startswith("aws/observability/cloudtrail/")
+
+
+def test_build_description_truncation_is_deterministic_and_distinguishes_keys():
+    desc_a = build_description("scope1", "x" * 2000 + "A", "_sourceCategory", CREATED, EXP)
+    desc_b = build_description("scope1", "x" * 2000 + "B", "_sourceCategory", CREATED, EXP)
+    assert desc_a != desc_b
+    assert parse_marker(desc_a).key != parse_marker(desc_b).key
+
+
 def test_parse_marker_round_trips_build_description():
     desc = build_description("cloudtrail-prod", "aws/observability/cloudtrail/logs",
                               "_sourceCategory", CREATED, EXP)

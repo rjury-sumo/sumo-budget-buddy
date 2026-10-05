@@ -118,10 +118,19 @@ class GlobalScopeError(ValueError):
     of defense against a bad value reaching this point by any other path."""
 
 
+def parse_scope_expr(expr: str) -> tuple[str, str]:
+    """Split a `field=value` scope expression into its two halves, e.g.
+    `_sourceCategory=*cloudtrail*` -> (`_sourceCategory`, `*cloudtrail*`).
+    The one place this split happens — shared by validate_scope_expr here,
+    cli.py's _resolve_scopes, and reconcile.py's _glob_value."""
+    field, _, value = expr.partition("=")
+    return field, value
+
+
 def validate_scope_expr(expr: str) -> None:
     """Raise GlobalScopeError if `expr` (a `field=value` string) has a blank
     or effectively-unconstrained value (only `*` characters, e.g. `*`, `**`)."""
-    _, _, value = expr.partition("=")
+    _, value = parse_scope_expr(expr)
     value = value.strip()
     if not value or value.strip("*") == "":
         raise GlobalScopeError(
@@ -157,12 +166,17 @@ def build_query(field: str, filter_glob: str, mode: str) -> str:
     # Only per_value has multiple output rows to order — aggregate always
     # collapses to 0 or 1 row, so a sort clause there would be a no-op.
     sort_clause = "\n| sort by gbytes desc" if mode == "per_value" else ""
+    # filter_glob is the scope's own (operator-controlled) value, but it's
+    # still spliced into a double-quoted query literal — escape backslash
+    # and embedded quotes so a value containing a literal `"` can't break
+    # out of the string or produce a malformed query.
+    escaped_glob = filter_glob.replace("\\", "\\\\").replace('"', '\\"')
 
     return (
         f'_index=sumologic_volume {field}={d["scope"]}\n'
         f'| parse regex "(?<data>\\{{[^\\{{]+\\}})" multi\n'
         f'| json field=data {d["json_alias"]} nodrop\n'
-        f'| where tolowercase({df}) matches tolowercase("{filter_glob}")\n'
+        f'| where tolowercase({df}) matches tolowercase("{escaped_glob}")\n'
         f'| bytes/1Gi as gbytes\n'
         f'| sum(gbytes) as gbytes, sum(count) as events{group_clause}{sort_clause}\n'
     ).rstrip()

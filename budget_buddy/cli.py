@@ -29,13 +29,15 @@ from budget_buddy.instance_config import (
 from budget_buddy.logging_setup import configure_logging
 from budget_buddy.output import infer_format, render_detail, render_rows
 from budget_buddy.reconcile import (
+    ActionKind,
     ClientCache,
     delete_budget,
     enforce_scope,
     evaluate_scope,
     sweep_registry,
 )
-from budget_buddy.registry import Registry
+from budget_buddy.registry import Registry, split_scope_key
+from budget_buddy.volume_query import parse_scope_expr
 
 logger = logging.getLogger("budget_buddy.cli")
 
@@ -131,8 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_del.add_argument("target", help="budget ID, or scope_name:key to resolve via the registry")
     p_del.add_argument("--instance", default="default")
     p_del.add_argument("--force", action="store_true",
-                        help="allow deleting a budget that doesn't carry a budget-buddy marker "
-                             "(default: refuse, so this can't delete an unrelated org budget by accident)")
+                        help="allow deleting a budget whose marker is missing or doesn't match "
+                             "(default: refuse, so this can't delete an unrelated org budget by "
+                             "accident); also clears a stale concurrency lock, same as enforce/sweep")
     p_del.add_argument("--dry-run", action="store_true")
 
     p_inst = sub.add_parser("instances", parents=[common],
@@ -182,14 +185,18 @@ def _resolve_scopes(args) -> list[ScopeConfig]:
             logger.warning(w)
         return select_scopes(cfg, args.scopes, args.all)
 
-    field = args.field
-    scope_expr = args.scope_expr
+    # getattr, not direct attribute access: `enforce`'s parser never adds
+    # the ad-hoc --field/--scope-expr flags (only `evaluate`'s does, since
+    # enforce-by-ad-hoc-scope isn't supported), so its Namespace has neither
+    # attribute at all when it falls through to here with no config found.
+    field = getattr(args, "field", None)
+    scope_expr = getattr(args, "scope_expr", None)
     if not field:
         # --field is redundant when --scope-expr already names it on its
         # left-hand side, e.g. "_sourceCategory=*cloudtrail*" — infer rather
         # than make the caller repeat it.
         if scope_expr and "=" in scope_expr:
-            field, _, _ = scope_expr.partition("=")
+            field, _ = parse_scope_expr(scope_expr)
         else:
             raise ConfigError(
                 "either --config (with --scope/--all), a config file at "
@@ -243,18 +250,28 @@ def _run_enforce(scopes: list[ScopeConfig], *, dry_run: bool) -> int:
         search_client, budgets_client = clients.get(instance)
         registry = Registry(instance)
 
-        swept = sweep_registry(registry, budgets_client, dry_run=dry_run)
+        # Scoped to just this run's targeted scopes — otherwise `enforce
+        # --scope foo` would also sweep (delete) any OTHER scope's expired
+        # entries on this instance as an unintended side effect.
+        scope_names = [s.name for s in inst_scopes]
+        swept = sweep_registry(registry, budgets_client, scope_names=scope_names, dry_run=dry_run)
         for r in swept:
             logger.info("sweep result: %s", asdict(r))
-            if r.action == "error":
+            if r.action == ActionKind.ERROR:
                 exit_code = 1
 
         for scope in inst_scopes:
-            results = enforce_scope(scope, search_client, budgets_client, registry, dry_run=dry_run)
+            try:
+                results = enforce_scope(scope, search_client, budgets_client, registry, dry_run=dry_run)
+            except Exception as exc:  # noqa: BLE001 - one scope's failure must not abort the rest
+                logger.error("enforce: scope %s failed, skipping: %s", scope.name, exc)
+                print(f"[{scope.name}] error: {exc}")
+                exit_code = 1
+                continue
             for r in results:
-                if r.action in ("error", "capped_uncovered", "skipped_invalid_scope"):
+                if r.action in (ActionKind.ERROR, ActionKind.CAPPED_UNCOVERED, ActionKind.SKIPPED_INVALID_SCOPE):
                     exit_code = 1
-                print(f"[{scope.name}] {r.action}: key={r.key!r} "
+                print(f"[{scope.name}] {r.action.value}: key={r.key!r} "
                       f"{'budget_id=' + r.budget_id if r.budget_id else ''} {r.detail}".strip())
     return exit_code
 
@@ -274,9 +291,9 @@ def cmd_sweep(args) -> int:
         results = sweep_registry(registry, budgets_client, scope_names=args.scopes, dry_run=args.dry_run)
         exit_code = 0
         for r in results:
-            if r.action == "error":
+            if r.action == ActionKind.ERROR:
                 exit_code = 1
-            print(f"{r.action}: scope={r.scope_name} key={r.key!r} budget_id={r.budget_id} {r.detail}".strip())
+            print(f"{r.action.value}: scope={r.scope_name} key={r.key!r} budget_id={r.budget_id} {r.detail}".strip())
         return exit_code
 
 
@@ -347,8 +364,9 @@ def cmd_status(args) -> int:
     _, budgets_client = ClientCache().get(args.instance)
     target = args.target
     budget_id = target
-    if ":" in target:
-        scope_name, _, key = target.partition(":")
+    split = split_scope_key(target)
+    if split is not None:
+        scope_name, key = split
         entry = Registry(args.instance).get(scope_name, key)
         if entry is None:
             print(f"no registry entry for {target!r}", file=sys.stderr)
@@ -370,15 +388,23 @@ def cmd_status(args) -> int:
 
 
 def cmd_delete(args) -> int:
-    _, budgets_client = ClientCache().get(args.instance)
-    registry = Registry(args.instance)
-    result = delete_budget(args.target, budgets_client, registry, force=args.force, dry_run=args.dry_run)
-    print(f"{result.action}: scope={result.scope_name} key={result.key!r} "
+    # Takes the same per-instance lock enforce/sweep use: delete_budget
+    # mutates the registry (and deletes a live budget) just like they do,
+    # so it must not run concurrently against the same registry file either.
+    with _multi_lock([args.instance], "delete", force=args.force):
+        _, budgets_client = ClientCache().get(args.instance)
+        registry = Registry(args.instance)
+        result = delete_budget(args.target, budgets_client, registry, force=args.force, dry_run=args.dry_run)
+    print(f"{result.action.value}: scope={result.scope_name} key={result.key!r} "
           f"budget_id={result.budget_id} {result.detail}".strip())
-    if result.action == "error":
+    if result.action == ActionKind.ERROR:
         return 1
-    if result.action == "skipped_marker_mismatch":
-        return 2
+    if result.action == ActionKind.SKIPPED_MARKER_MISMATCH:
+        # A distinct code from the generic usage-error 2 (see main()'s
+        # ConfigError/LockHeldError handler and cmd_instances_set) — a
+        # wrapper script branching on exit code must be able to tell "this
+        # was refused as a safety measure" apart from "bad CLI usage".
+        return 3
     return 0
 
 

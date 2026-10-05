@@ -191,6 +191,7 @@ def test_select_scopes_requires_name_or_all(tmp_path):
     ("max_budgets", 0),
     ("audit_threshold", 0),
     ("audit_threshold", 100),
+    ("ttl", "6h"),  # only "end_of_day" is actually implemented — see reconcile.enforce_scope
 ])
 def test_scope_config_field_validation(field, value):
     kwargs = dict(name="x", field="_sourceCategory", scope="_sourceCategory=*x*")

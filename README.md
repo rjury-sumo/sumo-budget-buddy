@@ -17,6 +17,79 @@ etc.).
 Full design rationale, API research, and live-verification notes:
 [`docs/budget-buddy-plan.md`](docs/budget-buddy-plan.md).
 
+## Quickstart
+
+A worked example, taken from a real run against a low-volume
+`_sourceCategory` called `otel/mac` — see each linked section below for the
+full flag reference.
+
+This example's `scope` pattern (`*otel*`) happens to match only that one
+value in the test org it ran against, which makes it easy to follow step by
+step. The typical real-world use is broader: a wildcard like
+`_sourceCategory=test/myapps/*` matching dozens or hundreds of distinct
+category values at once, each getting its own independently tracked,
+independently expiring budget under `mode: per_value` (the default) — one
+scope config entry, many budgets. `otel/mac` below stands in for "whichever
+one of those values happened to be over threshold this cycle."
+
+```bash
+# 0. Credentials (see Credentials below) — SUMO_ACCESS_ID / SUMO_ACCESS_KEY env vars,
+#    or an ~/.sumo/instances.toml entry for a named instance.
+
+# 1. Look before you budget anything — evaluate is always read-only.
+sumo-budget-buddy evaluate --scope-expr "_sourceCategory=*otel*" --field _sourceCategory
+#   otel/mac   0.0021 GB   9281 events   threshold=5 GiB   over_threshold=False
+# Comfortably under the 5 GiB default — nothing to enforce yet at that threshold.
+```
+
+```yaml
+# 2. Put a scope in ~/.sumo/budget-buddy.yaml. This one is deliberately strict for the
+#    example: flag otel/mac as an exception past 1 MB, but cap the resulting budget at
+#    just 10 KB so it blocks almost immediately — see "budget_capacity_bytes" below for
+#    why those two numbers don't have to match.
+scopes:
+  - name: otel-mac-demo
+    field: _sourceCategory
+    scope: "_sourceCategory=*otel*"
+    threshold_bytes: 1000000       # 1 MB — the evaluation threshold
+    budget_capacity_bytes: 10000   # 10 KB — the actual enforced cap
+```
+
+```bash
+# 3. Preview before touching anything live.
+sumo-budget-buddy enforce --scope otel-mac-demo --dry-run
+#   [otel-mac-demo] created: key='otel/mac'  dry-run: would create 'bb:otel-mac-demo:otel/mac:exp...' ...capacity=10000
+
+# 4. Run it for real.
+sumo-budget-buddy enforce --scope otel-mac-demo
+#   [otel-mac-demo] created: key='otel/mac' budget_id=00000000000096EC
+
+# 5. Check it right away — a brand-new budget always starts at 0 usage, regardless of
+#    how much that value had already ingested earlier today (see Config file below).
+sumo-budget-buddy status 00000000000096EC
+#   usage_bytes 0   usage_status Normal
+
+# 6. Check again a few minutes later, once new ingest has had a chance to arrive.
+sumo-budget-buddy status 00000000000096EC
+#   usage_bytes 13815   usage_status Exceeded   usage "EXCEEDED (13.5 KB @ trip)"
+# stopCollecting has now kicked in for otel/mac until this budget expires or is removed.
+
+# 7. See everything this tool is tracking, with enough detail to act on a row directly.
+sumo-budget-buddy list
+#   id                scope           key       type         usage                      capacity  action          expires
+#   00000000000096EC  otel-mac-demo   otel/mac  dailyVolume  EXCEEDED (13.5 KB @ trip)  9.8 KB    stopCollecting  2026-10-04T23:59:59-07:00
+
+# 8a. Left alone, it's removed automatically at the next calendar-day boundary (`ttl:
+#     end_of_day`, in the scope's tz) — enforce always sweeps expired entries first,
+#     or run sweep directly: sumo-budget-buddy sweep
+#
+# 8b. Want it gone sooner? delete removes one budget immediately — guarded by the
+#     budget-buddy marker check so it can't be pointed at an unrelated org budget
+#     by accident (--force overrides that).
+sumo-budget-buddy delete 00000000000096EC
+#   deleted: scope=otel-mac-demo key='otel/mac' budget_id=00000000000096EC name='bb:otel-mac-demo:otel/mac:exp...'
+```
+
 This tool has no import dependency on any other project — `http_client.py`,
 `instance_config.py`, `paths.py`, and the `VOLUME_DIMS` mapping in
 `volume_query.py` are self-contained. The only piece shared *by convention,

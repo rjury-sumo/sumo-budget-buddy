@@ -249,7 +249,7 @@ def enforce_scope(scope: ScopeConfig, search_client: SearchClient,
         # window in which a crash leaves a just-created budget untracked.
         registry.save()
         logger.info("enforce created scope=%s key=%s budget_id=%s bytes=%d capacity=%d expires=%s",
-                   scope.name, row.key, created.id, row.bytes, scope.threshold_bytes,
+                   scope.name, row.key, created.id, row.bytes, scope.budget_capacity_bytes,
                    expires_at.isoformat())
         results.append(ActionResult(scope.name, row.key, "created", budget_id=created.id, bytes=row.bytes))
 

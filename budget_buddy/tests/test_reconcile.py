@@ -112,6 +112,25 @@ def test_enforce_scope_uses_budget_capacity_bytes_when_set(tmp_path, monkeypatch
     assert created.capacity_bytes == 50
 
 
+def test_enforce_scope_logs_budget_capacity_bytes_not_threshold_bytes(tmp_path, monkeypatch, caplog):
+    # Regression: the "enforce created" log line once reported capacity as
+    # scope.threshold_bytes even when budget_capacity_bytes diverged from it —
+    # caught live when a 1,000,000-byte threshold scope created a budget
+    # actually capped at 10,000 bytes, but the audit log still said 1,000,000.
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    search = FakeSearchClient([_row_record("aws/x", 2000)])
+    budgets = FakeBudgetsClient()
+
+    with caplog.at_level("INFO", logger="budget_buddy.reconcile"):
+        reconcile.enforce_scope(_scope(threshold_bytes=1000, budget_capacity_bytes=50),
+                                 search, budgets, registry)
+
+    [created_log] = [r.message for r in caplog.records if "enforce created" in r.message]
+    assert "capacity=50" in created_log
+    assert "capacity=1000" not in created_log
+
+
 def test_enforce_scope_creates_and_persists_to_disk(tmp_path, monkeypatch):
     monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
     registry = Registry("default")

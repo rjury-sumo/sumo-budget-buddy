@@ -97,6 +97,21 @@ def _registry_entry(scope_name, key, budget_id, expires_in_hours):
 # enforce_scope
 # ---------------------------------------------------------------------------
 
+def test_enforce_scope_uses_budget_capacity_bytes_when_set(tmp_path, monkeypatch):
+    # The budget's capacity can be decoupled from the evaluation threshold —
+    # a scope flags exceptions at threshold_bytes but caps the created budget
+    # at the smaller budget_capacity_bytes.
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    search = FakeSearchClient([_row_record("aws/x", 2000)])
+    budgets = FakeBudgetsClient()
+
+    reconcile.enforce_scope(_scope(budget_capacity_bytes=50), search, budgets, registry)
+
+    [created] = budgets.budgets.values()
+    assert created.capacity_bytes == 50
+
+
 def test_enforce_scope_creates_and_persists_to_disk(tmp_path, monkeypatch):
     monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
     registry = Registry("default")
@@ -322,3 +337,126 @@ def test_sweep_registry_dry_run_does_not_mutate(tmp_path, monkeypatch):
 
     assert [r.action for r in results] == ["swept"]
     assert registry.get("s1", "k1") is not None  # not actually removed
+
+
+# ---------------------------------------------------------------------------
+# delete_budget — manual fix-up path, since sweep only ever touches
+# TTL-expired entries and there is otherwise no way to remove a budget early
+# ---------------------------------------------------------------------------
+
+def _managed_budget(budget_id: str, scope_name: str, key: str) -> IngestBudget:
+    desc = naming.build_description(scope_name, key, "_sourceCategory",
+                                     datetime.now(timezone.utc), datetime.now(timezone.utc))
+    return IngestBudget(
+        id=budget_id, name=f"bb:{scope_name}:{key}", scope=f"_sourceCategory={key}",
+        capacity_bytes=1000, action="stopCollecting", budget_type="dailyVolume",
+        description=desc, timezone="UTC", reset_time="00:00", audit_threshold=85,
+        usage_bytes=0, usage_status="Normal", created_at="", modified_at="",
+    )
+
+
+def test_delete_budget_by_raw_id_happy_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    registry.put(_registry_entry("s1", "k1", "B1", expires_in_hours=10.0))
+    registry.save()
+    budgets = FakeBudgetsClient()
+    budgets.budgets["B1"] = _managed_budget("B1", "s1", "k1")
+
+    result = reconcile.delete_budget("B1", budgets, registry)
+
+    assert result.action == "deleted"
+    assert "B1" not in budgets.budgets
+    reloaded = Registry("default")
+    assert reloaded.get("s1", "k1") is None  # registry entry forgotten too
+
+
+def test_delete_budget_by_scope_name_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    registry.put(_registry_entry("s1", "k1", "B1", expires_in_hours=10.0))
+    registry.save()
+    budgets = FakeBudgetsClient()
+    budgets.budgets["B1"] = _managed_budget("B1", "s1", "k1")
+
+    result = reconcile.delete_budget("s1:k1", budgets, registry)
+
+    assert result.action == "deleted"
+    assert result.budget_id == "B1"
+    assert "B1" not in budgets.budgets
+
+
+def test_delete_budget_scope_name_key_with_no_registry_entry_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    budgets = FakeBudgetsClient()
+
+    result = reconcile.delete_budget("s1:nope", budgets, registry)
+
+    assert result.action == "error"
+    assert budgets.budgets == {}
+
+
+def test_delete_budget_without_marker_is_refused(tmp_path, monkeypatch):
+    # Default guardrail: refuse to delete a budget with no budget-buddy
+    # marker, so this can't be pointed at an unrelated org budget by mistake.
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    budgets = FakeBudgetsClient()
+    budgets.budgets["B1"] = IngestBudget(
+        id="B1", name="hand-made", scope="_sourceCategory=k1", capacity_bytes=1000,
+        action="stopCollecting", budget_type="dailyVolume", description="not ours",
+        timezone="UTC", reset_time="00:00", audit_threshold=85, usage_bytes=0,
+        usage_status="Normal", created_at="", modified_at="",
+    )
+
+    result = reconcile.delete_budget("B1", budgets, registry)
+
+    assert result.action == "skipped_marker_mismatch"
+    assert "B1" in budgets.budgets  # never deleted
+
+
+def test_delete_budget_without_marker_force_overrides(tmp_path, monkeypatch):
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    budgets = FakeBudgetsClient()
+    budgets.budgets["B1"] = IngestBudget(
+        id="B1", name="hand-made", scope="_sourceCategory=k1", capacity_bytes=1000,
+        action="stopCollecting", budget_type="dailyVolume", description="not ours",
+        timezone="UTC", reset_time="00:00", audit_threshold=85, usage_bytes=0,
+        usage_status="Normal", created_at="", modified_at="",
+    )
+
+    result = reconcile.delete_budget("B1", budgets, registry, force=True)
+
+    assert result.action == "deleted"
+    assert "B1" not in budgets.budgets
+
+
+def test_delete_budget_already_gone_404_forgets_registry_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    registry.put(_registry_entry("s1", "k1", "B1", expires_in_hours=10.0))
+    registry.save()
+    budgets = FakeBudgetsClient()  # B1 not present -> get_budget raises 404
+
+    result = reconcile.delete_budget("s1:k1", budgets, registry)
+
+    assert result.action == "already_gone"
+    reloaded = Registry("default")
+    assert reloaded.get("s1", "k1") is None
+
+
+def test_delete_budget_dry_run_does_not_mutate(tmp_path, monkeypatch):
+    monkeypatch.setattr(bb_paths, "OUTPUT_ROOT", tmp_path)
+    registry = Registry("default")
+    registry.put(_registry_entry("s1", "k1", "B1", expires_in_hours=10.0))
+    registry.save()
+    budgets = FakeBudgetsClient()
+    budgets.budgets["B1"] = _managed_budget("B1", "s1", "k1")
+
+    result = reconcile.delete_budget("s1:k1", budgets, registry, dry_run=True)
+
+    assert result.action == "deleted"
+    assert "B1" in budgets.budgets  # not actually deleted
+    assert registry.get("s1", "k1") is not None  # not actually forgotten

@@ -117,7 +117,7 @@ defaults:                    # fallback values; any scope can override any key
   mode: per_value            # per_value | aggregate
   window: today               # today | yesterday | last_Nh | YYYY-MM-DD/YYYY-MM-DD
   tz: America/Los_Angeles
-  threshold_bytes: 5368709120  # 5 GiB
+  threshold_bytes: 5368709120  # 5 GiB — crossing this flags a value as an "exception"
   budget_type: dailyVolume     # dailyVolume | minuteVolume
   action: stopCollecting       # stopCollecting | keepCollecting
   max_budgets: 50
@@ -135,7 +135,16 @@ scopes:
     scope: "_sourceCategory=test/foo/*"
     mode: per_value              # each matching value tracked independently
     threshold_bytes: 1073741824  # 1 GiB override for this scope
+    budget_capacity_bytes: 10485760  # but cap the actual budget at 10 MiB once created
 ```
+
+`budget_capacity_bytes` (optional, any scope) decouples "what counts as an
+exception" from "how small a cap to actually enforce" — it defaults to
+`threshold_bytes` if omitted, matching the original all-in-one behavior. Set
+it lower to force near-immediate `stopCollecting` once a value is flagged,
+regardless of how much it had already ingested before the budget existed —
+a native budget's `usageBytes` always starts at 0 at creation, it is never
+backfilled with same-day ingest from before the budget existed.
 
 Supported `field` values (the only ones with a free `sumologic_volume` index
 dimension to measure against — see `volume_query.py`): `_sourceCategory`,
@@ -239,14 +248,15 @@ sumo-budget-buddy list [--instance NAME] [--all-budgets]
                        [--format table|json|csv] [--output PATH]
 ```
 
-Shows registry-tracked budgets with live usage. `--all-budgets` additionally
-lists every budget on the account (a live API call), with a `managed`
-column (yes/no, based on the `[managed-by=budget-buddy]` description marker)
-so you can see at a glance what this tool owns versus what a human or another
-tool created — budget-buddy only ever mutates the former. `--format` defaults
-to a terminal table; `json`/`csv` for scripting, `--output FILE` to write
-instead of stdout (format inferred from the extension if `--format` is
-omitted).
+Shows registry-tracked budgets with live usage, including each row's `id` so
+it can be passed straight to `status`/`delete` without a separate lookup.
+`--all-budgets` additionally lists every budget on the account (a live API
+call), with a `managed` column (yes/no, based on the `[managed-by=budget-buddy]`
+description marker) so you can see at a glance what this tool owns versus what
+a human or another tool created — budget-buddy only ever mutates the former.
+`--format` defaults to a terminal table; `json`/`csv` for scripting, `--output
+FILE` to write instead of stdout (format inferred from the extension if
+`--format` is omitted).
 
 ### `status` — one budget's detail
 
@@ -257,6 +267,23 @@ sumo-budget-buddy status <budget-id-or-scope_name:key> [--instance NAME]
 Accepts either a raw `/v2/ingestBudgets` ID or `scope_name:key` to resolve via
 the local registry. Shows capacity, usage, and whether it carries the
 budget-buddy marker.
+
+### `delete` — manual fix-up for one budget
+
+```
+sumo-budget-buddy delete <budget-id-or-scope_name:key> [--instance NAME]
+                         [--force] [--dry-run]
+```
+
+`sweep` only ever removes registry entries past their TTL — there is
+otherwise no way to undo a mistaken `enforce` before end-of-day. `delete`
+fills that gap: it deletes one budget immediately (by raw ID or
+`scope_name:key`, same resolution as `status`) and forgets its registry
+entry if there is one. It refuses to touch a budget whose description
+doesn't carry the `[managed-by=budget-buddy]` marker — `--force` overrides
+that guardrail for a budget that's unmanaged or whose marker doesn't match
+(use with care: unlike `enforce`/`sweep`'s `--force`, which only clears a
+stale lock, this one bypasses the "is this actually ours" check).
 
 ### `instances` — manage `~/.sumo/instances.toml`
 

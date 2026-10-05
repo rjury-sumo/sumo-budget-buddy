@@ -294,6 +294,21 @@ directly rather than re-deriving a percentage past the trip point:
 | `Exceeded` | `"EXCEEDED ({human_bytes(usageBytes)} @ trip — collection stopped)"` — the frozen value, explicitly labeled so it's never misread as a live/growing number |
 | `Unknown` | `"? (unable to retrieve usage)"` |
 
+**`usageBytes` starts at 0 at budget creation — it is never backfilled with
+ingest that already happened earlier in the current `dailyVolume` period.**
+Live-verified by creating a `dailyVolume` budget for a key that already had
+~1.8 MB ingested so far that calendar day: `usageBytes` on the create
+response, and on a `get` moments later, was `0`, not `1.8 MB`. Practically:
+the moment a `threshold_bytes` exception is caught by `enforce` tells you
+nothing about how soon the *budget* will actually trip — that depends only on
+new ingest from creation time onward, at whatever rate is currently flowing.
+A low-rate category can sit at 0%/Normal for hours against even a very small
+`budget_capacity_bytes`. This is the empirical reason `budget_capacity_bytes`
+exists as a field distinct from `threshold_bytes` (see Config file below) —
+if you want near-immediate blocking regardless of how slowly new data is
+arriving, the capacity has to be set low enough to trip on the next trickle,
+not sized relative to what already triggered the exception.
+
 This also resolves what the first draft of this plan flagged as an open
 "update-on-growth" question: for a `stopCollecting` budget, once tripped,
 *staying* tripped for the rest of the TTL window is the entire point (the tool
@@ -322,7 +337,13 @@ defaults:                    # fallback values; any scope can override any key
   mode: per_value            # per_value | aggregate
   window: today               # today | yesterday | last_Nh (N substituted) | explicit from/to
   tz: America/Los_Angeles
-  threshold_bytes: 5368709120  # 5 GiB
+  threshold_bytes: 5368709120  # 5 GiB — evaluation threshold: a value crossing this is
+                                # flagged as an "exception" and gets a budget
+  # budget_capacity_bytes: unset by default — falls back to threshold_bytes for whichever
+  # scope doesn't override it. Set it independently of threshold_bytes to decouple "what
+  # counts as an exception" from "how small a cap to actually enforce": e.g. flag at 1 GiB/
+  # day but cap the created budget at 10 MiB, so stopCollecting trips almost immediately
+  # rather than only once another full 1 GiB has flowed through since the budget was made.
   budget_type: dailyVolume     # dailyVolume | minuteVolume
   action: stopCollecting       # stopCollecting | keepCollecting
   ttl: end_of_day              # end_of_day (in `tz`) | explicit duration e.g. "6h"
@@ -344,6 +365,7 @@ scopes:
                                  # gets its own threshold + budget + TTL tracked
                                  # independently
     threshold_bytes: 1073741824  # 1 GiB override for this scope
+    budget_capacity_bytes: 10485760  # but the budget itself only allows 10 MiB once tripped
 
   - name: collector-watch
     field: _collector
@@ -510,6 +532,19 @@ sumo-budget-buddy list       [--instance NAME] [--all-budgets]
 sumo-budget-buddy status     <id-or-scope-name:value>
                               # one budget's detail + current usage via GET
 
+sumo-budget-buddy delete     <id-or-scope-name:value> [--instance NAME]
+                              [--force] [--dry-run]
+                              # fix-up path for undoing a mistaken enforce:
+                              # deletes one budget directly, bypassing TTL.
+                              # Refuses unless the live description carries
+                              # the [managed-by=budget-buddy] marker, same
+                              # check sweep applies before its own deletes —
+                              # --force here overrides *that* guardrail (not
+                              # a lock override, unlike enforce/sweep's
+                              # --force — this command takes no lock since
+                              # it targets one ID, not the whole registry).
+                              # Also forgets the registry entry, if any.
+
 sumo-budget-buddy instances  list | show <name> | set <name> [FIELDS...] | remove <name>
                               # CLI wrapper around ~/.sumo/instances.toml —
                               # list/show report has_credentials + per-field
@@ -524,11 +559,14 @@ sumo-budget-buddy instances  list | show <name> | set <name> [FIELDS...] | remov
 Default (registry-tracked only):
 
 ```text
-SCOPE            KEY                                    TYPE         USAGE                          CAPACITY   ACTION          EXPIRES (tz)
-cloudtrail-prod  aws/observability/cloudtrail/logs       dailyVolume  42% (2.1 GB / 5.0 GB)           5.0 GB     stopCollecting  2026-10-02 23:59:59 PT
-test-foo-rollup  test/foo/bar                            dailyVolume  EXCEEDED (1.0 GB @ trip)        1.0 GB     stopCollecting  2026-10-02 23:59:59 PT
-test-foo-rollup  test/foo/baz                             dailyVolume  12% (122 MB / 1.0 GB)           1.0 GB     stopCollecting  2026-10-02 23:59:59 PT
+ID                SCOPE            KEY                                TYPE         USAGE                      CAPACITY  ACTION          EXPIRES (tz)
+00000000000096EB  cloudtrail-prod  aws/observability/cloudtrail/logs  dailyVolume  42% (2.1 GB / 5.0 GB)      5.0 GB    stopCollecting  2026-10-02 23:59:59 PT
+00000000000096EC  test-foo-rollup  test/foo/bar                       dailyVolume  EXCEEDED (1.0 GB @ trip)   1.0 GB    stopCollecting  2026-10-02 23:59:59 PT
+00000000000096ED  test-foo-rollup  test/foo/baz                       dailyVolume  12% (122 MB / 1.0 GB)      1.0 GB    stopCollecting  2026-10-02 23:59:59 PT
 ```
+
+`ID` exists specifically so a row can be fed straight into `delete` for a
+fix-up without a separate lookup step.
 
 With `--all-budgets`, an extra `MANAGED` column (`yes`/`no`) is prepended, and
 rows for budgets lacking the `[managed-by=budget-buddy]` marker are included

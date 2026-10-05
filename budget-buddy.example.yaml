@@ -11,7 +11,11 @@ defaults:                    # fallback values; any scope can override any key
   mode: per_value            # per_value | aggregate
   window: today               # today | yesterday | last_Nh | YYYY-MM-DD/YYYY-MM-DD
   tz: America/Los_Angeles
-  threshold_bytes: 5368709120  # 5 GiB
+  threshold_bytes: 5368709120  # 5 GiB — evaluation threshold: crossing this makes a value an "exception"
+  # budget_capacity_bytes: unset here — defaults to threshold_bytes per scope unless overridden.
+  # Set it smaller than threshold_bytes to decouple "what counts as an exception" from "how small
+  # a cap to actually enforce" once one's found, e.g. flag at 1 GiB/day but cap the resulting
+  # budget at 10 MiB so collection stops almost immediately rather than only once 1 GiB is hit again.
   budget_type: dailyVolume     # dailyVolume | minuteVolume
   action: stopCollecting       # stopCollecting | keepCollecting
   max_budgets: 50
@@ -29,3 +33,4 @@ scopes:
     scope: "_sourceCategory=test/foo/*"
     mode: per_value              # each matching value tracked independently
     threshold_bytes: 1073741824  # 1 GiB override for this scope
+    budget_capacity_bytes: 10485760  # but cap the actual budget at 10 MiB once triggered

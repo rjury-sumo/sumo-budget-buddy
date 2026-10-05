@@ -13,7 +13,10 @@ from pathlib import Path
 import yaml
 
 from budget_buddy.volume_query import (
-    GlobalScopeError, UnsupportedFieldError, normalize_field, validate_scope_expr,
+    GlobalScopeError,
+    UnsupportedFieldError,
+    normalize_field,
+    validate_scope_expr,
 )
 
 DEFAULT_THRESHOLD_BYTES = 5 * 1024 ** 3  # 5 GiB
@@ -28,6 +31,7 @@ _SCOPE_DEFAULTS = {
     "window": "today",
     "tz": "America/Los_Angeles",
     "threshold_bytes": DEFAULT_THRESHOLD_BYTES,
+    "budget_capacity_bytes": None,
     "budget_type": "dailyVolume",
     "action": "stopCollecting",
     "ttl": "end_of_day",
@@ -51,6 +55,7 @@ class ScopeConfig:
     window: str = _SCOPE_DEFAULTS["window"]
     tz: str = _SCOPE_DEFAULTS["tz"]
     threshold_bytes: int = _SCOPE_DEFAULTS["threshold_bytes"]
+    budget_capacity_bytes: int | None = _SCOPE_DEFAULTS["budget_capacity_bytes"]
     budget_type: str = _SCOPE_DEFAULTS["budget_type"]
     action: str = _SCOPE_DEFAULTS["action"]
     ttl: str = _SCOPE_DEFAULTS["ttl"]
@@ -78,6 +83,15 @@ class ScopeConfig:
             raise ConfigError(f"scope {self.name!r}: action must be stopCollecting|keepCollecting")
         if self.threshold_bytes <= 0:
             raise ConfigError(f"scope {self.name!r}: threshold_bytes must be > 0")
+        if self.budget_capacity_bytes is None:
+            # Not set: the created budget's capacity mirrors the evaluation
+            # threshold (today's prior all-in-one behavior). Set explicitly to
+            # decouple "how much ingest counts as an exception" from "how small
+            # a cap to actually enforce" — e.g. flag at 1 GiB/day but cap the
+            # resulting budget at 10 MiB so it blocks almost immediately.
+            self.budget_capacity_bytes = self.threshold_bytes
+        elif self.budget_capacity_bytes <= 0:
+            raise ConfigError(f"scope {self.name!r}: budget_capacity_bytes must be > 0")
         if self.max_budgets <= 0:
             raise ConfigError(f"scope {self.name!r}: max_budgets must be > 0")
         if not (1 <= self.audit_threshold <= 99):

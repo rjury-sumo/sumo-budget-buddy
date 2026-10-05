@@ -55,6 +55,30 @@ def test_minimal_config_applies_builtin_defaults(tmp_path):
     assert s.instance == "default"
 
 
+def test_budget_capacity_bytes_defaults_to_threshold_bytes(tmp_path):
+    cfg = load_config(_write(tmp_path, MINIMAL))
+    s = cfg.scopes["cloudtrail-prod"]
+    assert s.budget_capacity_bytes == s.threshold_bytes
+
+
+def test_budget_capacity_bytes_can_be_set_independently(tmp_path):
+    text = MINIMAL.replace(
+        'scope: "_sourceCategory=*cloudtrail*"',
+        'scope: "_sourceCategory=*cloudtrail*"\n    threshold_bytes: 1073741824\n'
+        '    budget_capacity_bytes: 10485760',
+    )
+    cfg = load_config(_write(tmp_path, text))
+    s = cfg.scopes["cloudtrail-prod"]
+    assert s.threshold_bytes == 1073741824
+    assert s.budget_capacity_bytes == 10485760
+
+
+def test_budget_capacity_bytes_zero_raises():
+    with pytest.raises(ConfigError):
+        ScopeConfig(name="x", field="_sourceCategory", scope="_sourceCategory=*x*",
+                    budget_capacity_bytes=0)
+
+
 def test_top_level_instance_and_defaults_merge_and_override(tmp_path):
     cfg = load_config(_write(tmp_path, WITH_DEFAULTS_AND_OVERRIDE))
     a, b = cfg.scopes["a"], cfg.scopes["b"]

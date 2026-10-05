@@ -45,7 +45,8 @@ class ActionResult:
     scope_name: str
     key: str
     action: str  # created | skipped_existing | skipped_invalid_scope | swept |
-                 # swept_already_gone | skipped_marker_mismatch | capped_uncovered | error
+                 # swept_already_gone | skipped_marker_mismatch | capped_uncovered | error |
+                 # deleted | already_gone
     budget_id: str | None = None
     bytes: int | None = None
     detail: str = ""
@@ -225,12 +226,12 @@ def enforce_scope(scope: ScopeConfig, search_client: SearchClient,
         if dry_run:
             results.append(ActionResult(scope.name, row.key, "created", bytes=row.bytes,
                                          detail=f"dry-run: would create {name!r} scope={budget_scope_expr!r} "
-                                                f"capacity={scope.threshold_bytes}"))
+                                                f"capacity={scope.budget_capacity_bytes}"))
             continue
 
         try:
             created = budgets_client.create_budget(
-                name=name, scope=budget_scope_expr, capacity_bytes=scope.threshold_bytes,
+                name=name, scope=budget_scope_expr, capacity_bytes=scope.budget_capacity_bytes,
                 action=scope.action, budget_type=scope.budget_type, description=description,
                 timezone=scope.tz, reset_time="00:00", audit_threshold=scope.audit_threshold,
             )
@@ -262,3 +263,59 @@ def enforce_scope(scope: ScopeConfig, search_client: SearchClient,
                                      detail=f"max_budgets={scope.max_budgets} reached"))
 
     return results
+
+
+def _forget(registry: Registry, budget_id: str) -> None:
+    """Remove whatever registry entry points at `budget_id`, if any, and
+    persist immediately. Searches by budget_id rather than scope/key since a
+    raw-ID `delete_budget` call may not know which scope/key it belongs to."""
+    for entry in registry.all():
+        if entry.budget_id == budget_id:
+            registry.remove(entry.scope_name, entry.key)
+            registry.save()
+            return
+
+
+def delete_budget(target: str, budgets_client: IngestBudgetsV2Client, registry: Registry, *,
+                   force: bool = False, dry_run: bool = False) -> ActionResult:
+    """Manually delete one budget by raw ID or `scope_name:key` (resolved via
+    the registry) — the fix-up path for undoing a mistaken `enforce`, since
+    `sweep` only ever touches entries already past their TTL and there is
+    otherwise no way to remove a budget early. Refuses to delete anything
+    that doesn't carry the budget-buddy description marker unless `force` is
+    set, so this can't be pointed at an unrelated org budget by accident —
+    the same defensive check `sweep_registry` applies before its own deletes.
+    """
+    scope_name, key = "", target
+    budget_id = target
+    if ":" in target:
+        scope_name, _, key = target.partition(":")
+        entry = registry.get(scope_name, key)
+        if entry is None:
+            return ActionResult(scope_name, key, "error", detail=f"no registry entry for {target!r}")
+        budget_id = entry.budget_id
+
+    try:
+        live = budgets_client.get_budget(budget_id)
+    except BudgetAPIError as exc:
+        if exc.status_code == 404:
+            _forget(registry, budget_id)
+            return ActionResult(scope_name, key, "already_gone", budget_id=budget_id)
+        return ActionResult(scope_name, key, "error", budget_id=budget_id, detail=str(exc))
+
+    marker = naming.parse_marker(live.description)
+    if marker is not None and not scope_name:
+        scope_name, key = marker.scope_name, marker.key
+
+    if marker is None and not force:
+        return ActionResult(scope_name, key, "skipped_marker_mismatch", budget_id=budget_id,
+                             detail="no budget-buddy marker on this budget's description — "
+                                    "pass force=True to override")
+
+    if dry_run:
+        return ActionResult(scope_name, key, "deleted", budget_id=budget_id,
+                             detail=f"dry-run: would delete (name={live.name!r})")
+
+    budgets_client.delete_budget(budget_id)
+    _forget(registry, budget_id)
+    return ActionResult(scope_name, key, "deleted", budget_id=budget_id, detail=f"name={live.name!r}")

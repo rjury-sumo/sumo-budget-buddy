@@ -10,14 +10,31 @@ from contextlib import ExitStack
 from dataclasses import asdict
 
 from budget_buddy import instance_config, lock, naming
-from budget_buddy.config import ConfigError, DEFAULT_CONFIG_PATH, ScopeConfig, load_config, select_scopes
+from budget_buddy.config import (
+    DEFAULT_CONFIG_PATH,
+    ConfigError,
+    ScopeConfig,
+    load_config,
+    select_scopes,
+)
 from budget_buddy.instance_config import (
-    REGION_ENDPOINTS, endpoint_for_region, instance_status,
-    list_instances_with_status, load_instances, remove_instance, save_instance,
+    REGION_ENDPOINTS,
+    endpoint_for_region,
+    instance_status,
+    list_instances_with_status,
+    load_instances,
+    remove_instance,
+    save_instance,
 )
 from budget_buddy.logging_setup import configure_logging
 from budget_buddy.output import infer_format, render_detail, render_rows
-from budget_buddy.reconcile import ClientCache, enforce_scope, evaluate_scope, sweep_registry
+from budget_buddy.reconcile import (
+    ClientCache,
+    delete_budget,
+    enforce_scope,
+    evaluate_scope,
+    sweep_registry,
+)
 from budget_buddy.registry import Registry
 
 logger = logging.getLogger("budget_buddy.cli")
@@ -106,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", parents=[common], help="one budget's detail + current usage")
     p_status.add_argument("target", help="budget ID, or scope_name:key to resolve via the registry")
     p_status.add_argument("--instance", default="default")
+
+    p_del = sub.add_parser(
+        "delete", parents=[common],
+        help="manually delete one budget by ID or scope_name:key (fix-up use case; "
+             "sweep only ever removes TTL-expired entries)")
+    p_del.add_argument("target", help="budget ID, or scope_name:key to resolve via the registry")
+    p_del.add_argument("--instance", default="default")
+    p_del.add_argument("--force", action="store_true",
+                        help="allow deleting a budget that doesn't carry a budget-buddy marker "
+                             "(default: refuse, so this can't delete an unrelated org budget by accident)")
+    p_del.add_argument("--dry-run", action="store_true")
 
     p_inst = sub.add_parser("instances", parents=[common],
                              help=f"list or manage named Sumo instances ({instance_config.GLOBAL_CONFIG})")
@@ -284,12 +312,12 @@ def cmd_list(args) -> int:
         covered_ids.add(entry.budget_id)
         b = live.get(entry.budget_id)
         if b is None:
-            rows.append({"scope": entry.scope_name, "key": entry.key, "type": entry.budget_type,
-                         "usage": "? (not found live)", "capacity": "", "action": "",
-                         "expires": entry.expires_at, "managed": "yes"})
+            rows.append({"id": entry.budget_id, "scope": entry.scope_name, "key": entry.key,
+                         "type": entry.budget_type, "usage": "? (not found live)", "capacity": "",
+                         "action": "", "expires": entry.expires_at, "managed": "yes"})
             continue
         rows.append({
-            "scope": entry.scope_name, "key": entry.key, "type": b.budget_type,
+            "id": entry.budget_id, "scope": entry.scope_name, "key": entry.key, "type": b.budget_type,
             "usage": render_usage(b.usage_status, b.usage_bytes, b.capacity_bytes),
             "capacity": human_bytes(b.capacity_bytes), "action": b.action,
             "expires": entry.expires_at, "managed": "yes",
@@ -301,15 +329,15 @@ def cmd_list(args) -> int:
                 continue
             marker = naming.parse_marker(b.description)
             rows.append({
-                "scope": marker.scope_name if marker else "", "key": marker.key if marker else "",
-                "type": b.budget_type,
+                "id": b.id, "scope": marker.scope_name if marker else "",
+                "key": marker.key if marker else "", "type": b.budget_type,
                 "usage": render_usage(b.usage_status, b.usage_bytes, b.capacity_bytes),
                 "capacity": human_bytes(b.capacity_bytes), "action": b.action,
                 "expires": marker.expires_at if marker else "", "managed": "yes" if marker else "no",
             })
 
     columns = (["managed"] if args.all_budgets else []) + \
-              ["scope", "key", "type", "usage", "capacity", "action", "expires"]
+              ["id", "scope", "key", "type", "usage", "capacity", "action", "expires"]
     fmt = infer_format(args.output, args.format)
     render_rows(rows, columns, fmt=fmt, output=args.output, title="sumo-budget-buddy list")
     return 0
@@ -338,6 +366,19 @@ def cmd_status(args) -> int:
         "created_at": b.created_at, "modified_at": b.modified_at,
     }
     render_detail(detail, title=f"budget {b.id}")
+    return 0
+
+
+def cmd_delete(args) -> int:
+    _, budgets_client = ClientCache().get(args.instance)
+    registry = Registry(args.instance)
+    result = delete_budget(args.target, budgets_client, registry, force=args.force, dry_run=args.dry_run)
+    print(f"{result.action}: scope={result.scope_name} key={result.key!r} "
+          f"budget_id={result.budget_id} {result.detail}".strip())
+    if result.action == "error":
+        return 1
+    if result.action == "skipped_marker_mismatch":
+        return 2
     return 0
 
 
@@ -442,7 +483,7 @@ def main(argv: list[str] | None = None) -> int:
 
     handlers = {
         "evaluate": cmd_evaluate, "enforce": cmd_enforce, "sweep": cmd_sweep,
-        "list": cmd_list, "status": cmd_status, "instances": cmd_instances,
+        "list": cmd_list, "status": cmd_status, "delete": cmd_delete, "instances": cmd_instances,
     }
     try:
         return handlers[args.command](args)

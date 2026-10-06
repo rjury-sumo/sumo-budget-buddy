@@ -309,6 +309,24 @@ if you want near-immediate blocking regardless of how slowly new data is
 arriving, the capacity has to be set low enough to trip on the next trickle,
 not sized relative to what already triggered the exception.
 
+**A tripped budget does not stay quietly frozen across a calendar-day
+rollover — and the budget object itself is never deleted by Sumo, only by
+this tool's own `sweep`.** Live-verified across a real midnight-PT boundary:
+a `dailyVolume` budget's native usage counter resets to 0 on its own at
+`resetTime`/`timezone` (same as any native budget, budget-buddy-created or
+not) *independently* of this tool's registry TTL. A budget created the prior
+day, left untouched, was observed back in `Exceeded` early the next day —
+`usageBytes` had climbed from a frozen trip value, reset to 0 at local
+midnight, then climbed again on fresh same-category ingest and re-tripped,
+all while still fully live on the account. Nothing about the native API
+makes a budget's blocking behavior "just for that one day" — if whatever
+schedule runs `enforce`/`sweep` stops (a missed cron tick, a crashed host,
+the lock held past the window), a budget-buddy-created budget keeps
+blocking that category's ingest indefinitely into following days, not just
+until midnight. See "Scheduling" in the README for the recommended cron
+setup this motivates — specifically, a dedicated `sweep` tick near each
+scope's local midnight, not just a longer-interval `enforce` loop.
+
 This also resolves what the first draft of this plan flagged as an open
 "update-on-growth" question: for a `stopCollecting` budget, once tripped,
 *staying* tripped for the rest of the TTL window is the entire point (the tool
@@ -580,8 +598,10 @@ raw `usageBytes`/`usageStatus`/`capacityBytes`, not just the rendered string)
 for scripting.
 
 `enforce` = sweep expired → evaluate configured scope(s) → create/update
-budgets for exceptions. This is the one command meant to be put on a schedule
-(e.g. hourly cron); run multiple times a day safely due to idempotency.
+budgets for exceptions. This is the one command meant to be put on a schedule;
+run multiple times a day safely due to idempotency. See "Scheduling" in the
+README for the recommended interval and why a bare `enforce` cron isn't quite
+enough on its own near a calendar-day boundary.
 
 ### `evaluate` — the "opinionated endpoint" from requirement #1
 

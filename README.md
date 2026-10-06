@@ -391,6 +391,46 @@ The registry is the source of truth for *which* budget IDs to act on; the
 marker check is an independent confirmation immediately before anything
 destructive happens.
 
+## Scheduling
+
+Two separate cron entries, not one:
+
+```cron
+# 1. The main loop — catches new exceptions and creates budgets for them.
+*/15 * * * * sumo-budget-buddy enforce --config /path/to/budget-buddy.yaml --all
+
+# 2. A dedicated daily sweep, timed just after midnight in the tz your scopes
+#    use (America/Los_Angeles here) — belt-and-suspenders on top of #1.
+#    "5 0" is 00:05 in whatever timezone your cron scheduler itself runs in —
+#    convert from your scopes' tz accordingly (or set CRON_TZ=America/Los_Angeles
+#    on this line first, on cron implementations that support it).
+5 0 * * * sumo-budget-buddy sweep --config /path/to/budget-buddy.yaml
+```
+
+**Why `enforce` every 10-15 minutes, not tighter:** `evaluate` (which
+`enforce` always runs) uses the Sumo Search Job API — create a job, poll it,
+fetch results, delete it — once per targeted scope per run. That's a
+constrained resource shared with everything else hitting Search Job in the
+org, not something to hit every minute across many scopes. Every 10-15
+minutes is enough responsiveness for catching a new offender without
+meaningfully pressuring that quota; `sweep` alone (cron entry #2) makes *no*
+Search Job calls at all, so it's free to run as tightly as you like.
+
+**Why a dedicated sweep near midnight, when `enforce` already sweeps first
+on every run:** a native budget's own usage counter resets at local midnight
+independently of this tool's TTL tracking — and the budget object itself is
+*never* deleted by Sumo automatically, only by this tool's `sweep` (see
+`docs/budget-buddy-plan.md`, "Usage states (live-verified)"). Live-verified:
+a budget left in place past midnight re-tripped on the *next* day's fresh
+ingest, still fully live and still blocking, because nothing had called
+`sweep` yet. A 15-minute `enforce` cadence already bounds that gap to ~15
+minutes in the common case, but a prior run that's still holding the
+concurrency lock, a missed cron tick, or a host outage right at the boundary
+can stretch that gap much further — the extra midnight-adjacent `sweep` tick
+is specifically there to bound *that* worst case tightly, independent of
+whatever else is or isn't running. If your scopes span more than one
+timezone, add one sweep entry per timezone in play.
+
 ## Concurrency
 
 `enforce`/`sweep` take a PID-file lock
